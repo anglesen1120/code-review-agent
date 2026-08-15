@@ -44,10 +44,17 @@ issue is gone. If a dev replies and resolves a thread manually, the agent
 ## Quick start (consumer repo)
 
 1. **Create a Personal Access Token** for auto-resolve (this is required —
-   see *Why a PAT?* below). Classic token with `repo` scope (or fine-grained
-   with **Pull requests: write** + **Contents: read** on this repo). Add it as
-   a secret, e.g. `CODE_REVIEW_TOKEN` (Settings → Secrets and variables →
-   Actions).
+   see *Why a PAT?* below).
+   - **Classic** token with the `repo` scope — simplest, covers every endpoint
+     the agent uses.
+   - **Fine-grained** token: under *Repository access* pick **All
+     repositories** or explicitly select the repo, and grant **Contents:
+     Read-only**, **Pull requests: Read and write**, and **Issues: Read and
+     write**. The **Issues** permission is required for the summary comment;
+     without it (or without repository access to the repo) every write returns
+     `Resource not accessible by personal access token` (HTTP 403).
+   Add it as a secret, e.g. `CODE_REVIEW_TOKEN` (Settings → Secrets and
+   variables → Actions).
 2. Add a secret for your provider key, e.g. `DEEPSEEK_API_KEY` (Settings →
    Secrets and variables → Actions). For the default OpenCode Go provider this
    is the key from your opencode config (`provider.go.options.apiKey`).
@@ -94,7 +101,8 @@ threads but **cannot resolve them** — the `resolveReviewThread` mutation retur
 `Resource not accessible by integration` even with `pull-requests: write`.
 Auto-resolving threads that the agent previously flagged therefore requires a
 token with the same write rights as a real user: a classic PAT with the `repo`
-scope (or a fine-grained PAT with **Pull requests: write**).
+scope (or a fine-grained PAT with **Pull requests: write** and **Issues:
+write**, plus repository access to the repo — see the quick-start step above).
 
 With a PAT the review threads are authored by **you** (your username), so set
 `bot-login` to your username. Without a PAT the threads are authored by

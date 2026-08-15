@@ -321,10 +321,12 @@ async function cmdApply() {
   );
 
   let reviewId = null;
+  let posted = 0;
   if (toPost.length > 0) {
     try {
       reviewId = (await postReview(owner, repo, number, headSha,
         toPost.map((f) => ({ path: f.file, line: f.line, side: "RIGHT", body: markdownThread(f) })))).id;
+      posted = toPost.length;
     } catch {
       // Whole-review failed (likely one invalid line anchor). Retry per comment,
       // dropping the ones GitHub rejects; those findings still reach the summary.
@@ -332,8 +334,9 @@ async function cmdApply() {
         try {
           reviewId = (await postReview(owner, repo, number, headSha,
             [{ path: f.file, line: f.line, side: "RIGHT", body: markdownThread(f) }])).id;
-        } catch {
-          console.error(`post-review: could not post inline comment at ${f.file}:${f.line}; added to summary only`);
+          posted += 1;
+        } catch (e) {
+          console.error(`post-review: could not post inline comment at ${f.file}:${f.line}: ${e.message}`);
         }
       }
     }
@@ -357,7 +360,27 @@ async function cmdApply() {
     repo,
     unresolvedCount,
   });
-  await upsertSummaryComment(owner, repo, number, summaryBody);
+  try {
+    await upsertSummaryComment(owner, repo, number, summaryBody);
+  } catch (e) {
+    // The summary comment is informational; the merge gate is the threads. A
+    // blocked summary must not fail a run whose threads were delivered.
+    console.error(
+      "post-review: could not create/update the summary comment (threads are unaffected). " +
+        "If using a fine-grained PAT, grant Issues: read and write; a classic repo-scoped PAT also works. " +
+        e.message,
+    );
+  }
+
+  // If the token could not deliver any inline thread, fail loudly — a run that
+  // "succeeds" with nothing posted reads as a clean review.
+  if (toPost.length > 0 && posted === 0) {
+    console.error(
+      "post-review: could not post any review thread — the token cannot write to this repository " +
+        "(check github-token: Pull requests: write, Issues: write, and repository access).",
+    );
+    process.exit(1);
+  }
 
   if (process.env.SET_STATUS === "true") {
     const state = unresolvedCount > 0 ? "failure" : "success";

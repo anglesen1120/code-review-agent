@@ -16,7 +16,8 @@ inputs:
       Token with pull-requests: write and contents: read. Defaults to
       github.token, which CAN post threads but CANNOT resolve them (GitHub
       limitation). Pass a classic PAT with the repo scope (or fine-grained PAT
-      with Pull requests: write) to enable auto-resolve of review threads.
+      with Pull requests: write + Issues: write, with repository access to
+      this repo) to enable auto-resolve of review threads.
     required: false
     default: ${{ github.token }}
   base-url:
