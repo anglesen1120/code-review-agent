@@ -16,7 +16,13 @@
 #   API_KEY_ENV  env var name holding the key, default DEEPSEEK_API_KEY
 set -uo pipefail
 
-SCRATCH="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cra"
+# Local mode: write into the repo's gitignored .review/ dir so results are easy
+# to find. CI mode: use the runner's temp dir.
+if [ "${MODE:-ci}" = "local" ] && [ -z "${RUNNER_TEMP:-}" ]; then
+  SCRATCH="${LOCAL_SCRATCH:-$(pwd)/.review}"
+else
+  SCRATCH="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cra"
+fi
 mkdir -p "$SCRATCH"
 ACTION_PATH="${ACTION_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 

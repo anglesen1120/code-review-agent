@@ -1,0 +1,111 @@
+name: "Code Review Agent"
+description: >-
+  Reviews pull requests with a self-contained opencode agent and posts inline
+  review threads + a summary comment. Unresolved threads block merge via GitHub
+  branch protection. No external review SaaS.
+author: "anglesen1120"
+
+inputs:
+  api-key:
+    description: >-
+      Provider API key for the opencode analyzer (OpenAI-compatible endpoint),
+      e.g. the DEEPSEEK_API_KEY secret.
+    required: true
+  github-token:
+    description: "Token with pull-requests: write and contents: read. Defaults to github.token."
+    required: false
+    default: ${{ github.token }}
+  base-url:
+    description: "Provider endpoint base URL (OpenAI-compatible)."
+    required: false
+    default: "https://api.deepseek.com/v1"
+  model:
+    description: "Provider/model for the analyzer, e.g. deepseek/deepseek-v4-flash."
+    required: false
+    default: "deepseek/deepseek-v4-flash"
+  diff-scope:
+    description: "Extra comma-separated gitignore-style patterns to exclude from review."
+    required: false
+    default: ""
+  set-status:
+    description: "Also set a commit status (failure while unresolved Critical/Warning threads remain)."
+    required: false
+    default: "false"
+
+outputs:
+  findings-count:
+    description: "Total findings (all severities) for this run."
+  unresolved-count:
+    description: "Open Critical/Warning threads remaining after this run."
+  review-id:
+    description: "GitHub review node id created this run, if any."
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install opencode CLI
+      shell: bash
+      run: npm install -g opencode-ai@1.18.18
+
+    - name: Prepare inputs and compute diff
+      id: prepare
+      shell: bash
+      env:
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        DIFF_SCOPE: ${{ inputs.diff-scope }}
+      run: |
+        set -euo pipefail
+        SCRATCH="$RUNNER_TEMP/cra"
+        mkdir -p "$SCRATCH"
+        git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+        {
+          echo "PR_NUMBER=$PR_NUMBER"
+          echo "BASE_SHA=$BASE_SHA"
+          echo "HEAD_SHA=$HEAD_SHA"
+          echo "MODEL=${{ inputs.model }}"
+          echo "BASE_URL=${{ inputs.base-url }}"
+        } > "$SCRATCH/env"
+        excludes=( ':(exclude)*.lock' ':(exclude)*.min.js' ':(exclude)*.min.css' ':(exclude)*.map'
+                   ':(exclude)yarn.lock' ':(exclude)pnpm-lock.yaml' ':(exclude)package-lock.json'
+                   ':(exclude)**/dist/**' ':(exclude)**/obj/**' ':(exclude)**/bin/**' ':(exclude)**/node_modules/**' )
+        IFS=',' read -r -a extra <<< "${DIFF_SCOPE:-}"
+        for p in "${extra[@]}"; do
+          p="${p// /}"
+          [ -n "$p" ] && excludes+=(":(exclude)$p")
+        done
+        git diff --no-color -U5 "$BASE_SHA"... "$HEAD_SHA" -- . "${excludes[@]}" > "$SCRATCH/pr.diff" || true
+        git diff --name-only "$BASE_SHA"... "$HEAD_SHA" -- . "${excludes[@]}" \
+          | SCRATCH="$SCRATCH" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const fs=require("fs");fs.writeFileSync(process.env.SCRATCH+"/changed_files.json",JSON.stringify(d.split("\n").filter(Boolean)))})'
+        echo "diff_bytes=$(wc -c < "$SCRATCH/pr.diff" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
+
+    - name: Fetch existing bot review threads
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: node "${{ github.action_path }}/scripts/post-review.js" fetch
+
+    - name: Analyze with opencode (headless)
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        MODE: ci
+        DEEPSEEK_API_KEY: ${{ inputs.api-key }}
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+        RUNNER_TEMP: ${{ runner.temp }}
+      run: bash "${{ github.action_path }}/scripts/analyze.sh"
+
+    - name: Post threads, resolve fixed, update summary
+      id: apply
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        SET_STATUS: ${{ inputs.set-status }}
+        RUNNER_TEMP: ${{ runner.temp }}
+      run: |
+        . "$RUNNER_TEMP/cra/env" 2>/dev/null || true
+        node "${{ github.action_path }}/scripts/post-review.js" apply

@@ -285,7 +285,7 @@ async function cmdApply() {
     console.error("post-review: findings failed validation: " + validation.errors.join("; "));
   }
   const existing = readJSON(scratch("existing_threads.json")) ?? { threads: [] };
-  const changedFiles = JSON.parse(process.env.CHANGED_FILES || "[]");
+  const changedFiles = readJSON(scratch("changed_files.json")) ?? [];
 
   const { toPost, toResolve, unresolvedCount, counts } = computeDelta(
     findingsData.findings,
