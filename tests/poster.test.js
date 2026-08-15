@@ -5,6 +5,8 @@ import {
   threadKey,
   normalizeTitle,
   sameLocationGuard,
+  similarTitle,
+  isBotAuthor,
   markdownThread,
   markdownSummary,
 } from "../scripts/post-review.js";
@@ -142,6 +144,52 @@ test("sameLocationGuard unit behavior", () => {
   assert.equal(sameLocationGuard(thread, F({ line: 10, title: "Missing null check! " })), true);
   assert.equal(sameLocationGuard(thread, F({ line: 11, title: "missing null check" })), false);
   assert.equal(sameLocationGuard(thread, F({ line: 10, title: "add cancellation token" })), false);
+});
+
+test("isBotAuthor accepts both github-actions spellings", () => {
+  assert.equal(isBotAuthor("github-actions", "github-actions"), true);
+  assert.equal(isBotAuthor("github-actions[bot]", "github-actions[bot]"), true);
+  assert.equal(isBotAuthor("github-actions", "github-actions[bot]"), true);
+  assert.equal(isBotAuthor("github-actions[bot]", "github-actions"), true);
+  assert.equal(isBotAuthor("copilot-pull-request-reviewer", "github-actions"), false);
+  assert.equal(isBotAuthor(null, "github-actions"), false);
+});
+
+test("similarTitle matches LLM re-wordings of the same issue", () => {
+  assert.equal(
+    similarTitle(
+      "Parameterize SQL query to prevent SQL injection in getUser",
+      "SQL injection via string concatenation in getUser",
+    ),
+    true,
+  );
+  assert.equal(similarTitle("Race condition on shared state", "SQL injection via string concat"), false);
+});
+
+test("title-dedup suppresses a re-worded issue even when the line shifted", () => {
+  // Old thread reported the getUser injection at line 19; after a rework the
+  // same issue now sits at line 17 with a re-worded title. It must NOT be posted
+  // again (no duplicate thread).
+  const findings = [F({ severity: "Critical", file: "a.cs", line: 17, title: "SQL injection via string concatenation in getUser" })];
+  const threads = [
+    T({ id: "old", path: "a.cs", line: 19, title: "Parameterize SQL query to prevent SQL injection in getUser" }),
+  ];
+  const { toPost } = computeDelta(findings, threads, ["a.cs"]);
+  assert.equal(toPost.length, 0);
+});
+
+test("title-dedup never re-nags an issue a dev already resolved", () => {
+  const findings = [F({ severity: "Critical", file: "a.cs", line: 10, title: "SQL injection via string concatenation in getUser" })];
+  const threads = [T({ id: "resolved", path: "a.cs", line: 9, title: "Parameterize SQL query to prevent SQL injection in getUser", isResolved: true })];
+  const { toPost } = computeDelta(findings, threads, ["a.cs"]);
+  assert.equal(toPost.length, 0);
+});
+
+test("title-dedup does not block a genuinely different issue at the same path", () => {
+  const findings = [F({ severity: "Critical", file: "a.cs", line: 10, title: "Race condition on shared state" })];
+  const threads = [T({ id: "r1", path: "a.cs", line: 10, title: "SQL injection via string concatenation" })];
+  const { toPost } = computeDelta(findings, threads, ["a.cs"]);
+  assert.equal(toPost.length, 1);
 });
 
 // ---- markdown ----

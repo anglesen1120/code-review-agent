@@ -34,10 +34,10 @@ inputs:
   bot-login:
     description: >-
       Login of the token that posts/resolves review threads. For github.token
-      this is always "github-actions[bot]". Only change when supplying a
-      personal access token via github-token.
+      this is "github-actions". Only change when supplying a personal access
+      token via github-token.
     required: false
-    default: "github-actions[bot]"
+    default: "github-actions"
 
 outputs:
   findings-count:

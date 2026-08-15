@@ -28,19 +28,26 @@ export const rank = { Critical: 3, Warning: 2, Info: 1 };
 
 const significant = (t) => normalizeTitle(t).split(" ").filter((w) => w.length > 2);
 
+// Fuzzy title similarity for LLM re-wordings ("Parameterize SQL query to
+// prevent SQL injection in getUser" vs "SQL injection via string concatenation
+// in getUser"). Strict enough that distinct issues rarely match.
+export function similarTitle(a, b) {
+  const wa = significant(a ?? "");
+  const wb = significant(b ?? "");
+  if (wa.length === 0 || wb.length === 0) return false;
+  const shared = wa.filter((w) => wb.includes(w)).length;
+  if (shared >= 3 && shared >= Math.min(wa.length, wb.length) / 2) return true;
+  const na = normalizeTitle(a ?? "");
+  const nb = normalizeTitle(b ?? "");
+  return na.length > 3 && (nb.startsWith(na) || na.startsWith(nb));
+}
+
 // Fuzzy guard: if an open, current thread sits at the same path:line with a
 // near-identical title, treat the finding as already reported (LLM re-wording).
 export function sameLocationGuard(thread, finding) {
   if (!thread || thread.path !== finding.file) return false;
   if (thread.line !== finding.line) return false;
-  const a = significant(thread.title ?? "");
-  const b = significant(finding.title);
-  if (a.length === 0 || b.length === 0) return false;
-  const shared = a.filter((w) => b.includes(w)).length;
-  if (shared >= 3 && shared >= Math.min(a.length, b.length) / 2) return true;
-  const na = normalizeTitle(thread.title ?? "");
-  const nb = normalizeTitle(finding.title);
-  return na.length > 3 && (nb.startsWith(na) || na.startsWith(nb));
+  return similarTitle(thread.title, finding.title);
 }
 
 /**
@@ -66,11 +73,18 @@ export function computeDelta(findings, existingThreads, changedFiles) {
     if (!t.isResolved && !t.isOutdated) openCurrentByPathLine.set(`${t.path}:${t.line}`, t);
   }
 
+  // A finding whose issue was already reported at the same path with a
+  // near-identical title is never re-posted — even if the line shifted after a
+  // rework, and even if a dev resolved it (never re-nag).
+  const alreadyReportedByTitle = (f) =>
+    existingThreads.some((t) => t.path === f.file && similarTitle(t.title ?? "", f.title));
+
   const toPost = [];
   for (const f of desired.values()) {
     if (allByKey.has(threadKey(f))) continue; // already reported -> leave open (or dev-resolved)
     const same = openCurrentByPathLine.get(`${f.file}:${f.line}`);
     if (same && sameLocationGuard(same, f)) continue; // fuzzy duplicate guard
+    if (alreadyReportedByTitle(f)) continue; // same issue, re-worded or line shifted
     toPost.push(f);
   }
 
@@ -201,6 +215,16 @@ function titleFromBody(body) {
   return first.replace(/^\*\*[^*]*\*\*\s*(—|-)?\s*/, "");
 }
 
+// GitHub reports the Actions GITHUB_TOKEN identity sometimes as `github-actions`
+// (the app) and sometimes as `github-actions[bot]`; accept both so a re-run of
+// the same PR still finds the bot's own threads.
+export function isBotAuthor(login, botLogin) {
+  if (!login) return false;
+  if (login === botLogin) return true;
+  const variants = new Set(["github-actions", "github-actions[bot]"]);
+  return variants.has(login) && variants.has(botLogin);
+}
+
 async function fetchExistingThreads(owner, repo, number, botLogin) {
   const threads = [];
   let cursor = null;
@@ -211,7 +235,7 @@ async function fetchExistingThreads(owner, repo, number, botLogin) {
     if (!data) break;
     for (const node of data.nodes ?? []) {
       const root = node.comments?.nodes?.[0];
-      if (!root || root.author?.login !== botLogin) continue;
+      if (!root || !isBotAuthor(root.author?.login, botLogin)) continue;
       const title = titleFromBody(root.body);
       const line = node.line ?? node.originalLine ?? 0;
       threads.push({
@@ -237,10 +261,11 @@ async function cmdFetch() {
     console.error("post-review: GITHUB_REPOSITORY and PR_NUMBER are required");
     process.exit(2);
   }
-  // The GitHub Actions GITHUB_TOKEN is a fine-grained token whose login is
-  // always `github-actions[bot]` and which cannot read GET /user (HTTP 403).
-  // Derive the login from BOT_LOGIN instead of querying it.
-  const botLogin = process.env.BOT_LOGIN || "github-actions[bot]";
+  // The GitHub Actions GITHUB_TOKEN is a fine-grained token that cannot read
+  // GET /user (HTTP 403). Its identity in API responses is `github-actions`
+  // (the app), so default BOT_LOGIN to that; a personal access token user can
+  // override via the bot-login input.
+  const botLogin = process.env.BOT_LOGIN || "github-actions";
   const threads = await fetchExistingThreads(owner, repo, number, botLogin);
   writeFileSync(scratch("existing_threads.json"), JSON.stringify({ botLogin, threads }, null, 2));
   console.log(`post-review: found ${threads.length} bot thread(s) as ${botLogin}`);
