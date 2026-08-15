@@ -43,10 +43,15 @@ issue is gone. If a dev replies and resolves a thread manually, the agent
 
 ## Quick start (consumer repo)
 
-1. Add a secret for your provider key, e.g. `DEEPSEEK_API_KEY` (Settings →
+1. **Create a Personal Access Token** for auto-resolve (this is required —
+   see *Why a PAT?* below). Classic token with `repo` scope (or fine-grained
+   with **Pull requests: write** + **Contents: read** on this repo). Add it as
+   a secret, e.g. `CODE_REVIEW_TOKEN` (Settings → Secrets and variables →
+   Actions).
+2. Add a secret for your provider key, e.g. `DEEPSEEK_API_KEY` (Settings →
    Secrets and variables → Actions). For the default OpenCode Go provider this
    is the key from your opencode config (`provider.go.options.apiKey`).
-2. Add the workflow (copy `example/.github/workflows/code-review.yml`):
+3. Add the workflow (copy `example/.github/workflows/code-review.yml`):
 
    ```yaml
    name: Code Review
@@ -67,17 +72,34 @@ issue is gone. If a dev replies and resolves a thread manually, the agent
          - uses: anglesen1120/code-review-agent@v1
            with:
              api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+             github-token: ${{ secrets.CODE_REVIEW_TOKEN }}
+             bot-login: <your-github-username>
    ```
 
-3. Enable branch protection on your default branch (Settings → Branches):
+   Leave `github-token` unset (and remove `bot-login`) if you are happy for the
+   bot to post threads but **never auto-resolve them** — in that case reviewers
+   resolve conversations manually.
+
+4. Enable branch protection on your default branch (Settings → Branches):
    - **Require a pull request before merging** (recommended).
    - **Require conversation resolution before merging** — this is the gate that
      blocks merge while review threads are unresolved.
    - Optional: if you set `set-status: true`, also add the `code-review-agent`
      status check as required.
 
-The action posts inline threads as `github-actions[bot]`. It needs
-`pull-requests: write` (see the workflow's `permissions` block).
+### Why a PAT?
+
+GitHub's built-in `GITHUB_TOKEN` (the `github-actions` app) can **post** review
+threads but **cannot resolve them** — the `resolveReviewThread` mutation returns
+`Resource not accessible by integration` even with `pull-requests: write`.
+Auto-resolving threads that the agent previously flagged therefore requires a
+token with the same write rights as a real user: a classic PAT with the `repo`
+scope (or a fine-grained PAT with **Pull requests: write**).
+
+With a PAT the review threads are authored by **you** (your username), so set
+`bot-login` to your username. Without a PAT the threads are authored by
+`github-actions`; they still block merge, and the agent still avoids re-posting,
+but nobody (agent included) can auto-resolve them from CI.
 
 ## Inputs
 

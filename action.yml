@@ -12,7 +12,11 @@ inputs:
       e.g. the DEEPSEEK_API_KEY secret.
     required: true
   github-token:
-    description: "Token with pull-requests: write and contents: read. Defaults to github.token."
+    description: >-
+      Token with pull-requests: write and contents: read. Defaults to
+      github.token, which CAN post threads but CANNOT resolve them (GitHub
+      limitation). Pass a classic PAT with the repo scope (or fine-grained PAT
+      with Pull requests: write) to enable auto-resolve of review threads.
     required: false
     default: ${{ github.token }}
   base-url:
@@ -34,8 +38,9 @@ inputs:
   bot-login:
     description: >-
       Login of the token that posts/resolves review threads. For github.token
-      this is "github-actions". Only change when supplying a personal access
-      token via github-token.
+      this is "github-actions". When supplying a personal access token via
+      github-token, set this to your GitHub username so the agent recognises
+      its own threads.
     required: false
     default: "github-actions"
 

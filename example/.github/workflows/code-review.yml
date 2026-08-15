@@ -18,3 +18,8 @@ jobs:
       - uses: anglesen1120/code-review-agent@v1
         with:
           api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          # A classic PAT (repo scope) is required for the agent to auto-resolve
+          # threads it previously flagged. Without it, GITHUB_TOKEN can post
+          # threads but cannot resolve them. Set bot-login to your username.
+          github-token: ${{ secrets.CODE_REVIEW_TOKEN }}
+          bot-login: your-github-username
