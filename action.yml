@@ -31,6 +31,13 @@ inputs:
     description: "Also set a commit status (failure while unresolved Critical/Warning threads remain)."
     required: false
     default: "false"
+  bot-login:
+    description: >-
+      Login of the token that posts/resolves review threads. For github.token
+      this is always "github-actions[bot]". Only change when supplying a
+      personal access token via github-token.
+    required: false
+    default: "github-actions[bot]"
 
 outputs:
   findings-count:
@@ -86,6 +93,7 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        BOT_LOGIN: ${{ inputs.bot-login }}
       run: node "${{ github.action_path }}/scripts/post-review.js" fetch
 
     - name: Analyze with opencode (headless)

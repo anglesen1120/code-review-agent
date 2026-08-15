@@ -237,8 +237,10 @@ async function cmdFetch() {
     console.error("post-review: GITHUB_REPOSITORY and PR_NUMBER are required");
     process.exit(2);
   }
-  const me = await rest("GET", "user");
-  const botLogin = me.login;
+  // The GitHub Actions GITHUB_TOKEN is a fine-grained token whose login is
+  // always `github-actions[bot]` and which cannot read GET /user (HTTP 403).
+  // Derive the login from BOT_LOGIN instead of querying it.
+  const botLogin = process.env.BOT_LOGIN || "github-actions[bot]";
   const threads = await fetchExistingThreads(owner, repo, number, botLogin);
   writeFileSync(scratch("existing_threads.json"), JSON.stringify({ botLogin, threads }, null, 2));
   console.log(`post-review: found ${threads.length} bot thread(s) as ${botLogin}`);
