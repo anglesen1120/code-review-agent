@@ -75,8 +75,8 @@ runs:
           p="${p// /}"
           [ -n "$p" ] && excludes+=(":(exclude)$p")
         done
-        git diff --no-color -U5 "$BASE_SHA"... "$HEAD_SHA" -- . "${excludes[@]}" > "$SCRATCH/pr.diff" || true
-        git diff --name-only "$BASE_SHA"... "$HEAD_SHA" -- . "${excludes[@]}" \
+        git diff --no-color -U5 "$BASE_SHA...$HEAD_SHA" -- . "${excludes[@]}" > "$SCRATCH/pr.diff" || true
+        git diff --name-only "$BASE_SHA...$HEAD_SHA" -- . "${excludes[@]}" \
           | SCRATCH="$SCRATCH" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const fs=require("fs");fs.writeFileSync(process.env.SCRATCH+"/changed_files.json",JSON.stringify(d.split("\n").filter(Boolean)))})'
         echo "diff_bytes=$(wc -c < "$SCRATCH/pr.diff" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
 
