@@ -1,14 +1,14 @@
 // Generates the opencode.json used for the read-only code-reviewer run.
 // Zero dependencies. Reads env:
-//   BASE_URL     default https://api.deepseek.com/v1
-//   MODEL        provider/model, default deepseek/deepseek-v4-flash
+//   BASE_URL     default https://opencode.ai/zen/go/v1 (OpenCode Go)
+//   MODEL        provider/model, default go/deepseek-v4-flash
 //   PROMPT_FILE  path to prompts/reviewer-system.md (embedded as the agent prompt)
 //   API_KEY_ENV  env var name holding the provider API key, default DEEPSEEK_API_KEY
 //   OUT          output path for opencode.json
 import { readFileSync, writeFileSync } from "node:fs";
 
-const baseUrl = process.env.BASE_URL || "https://api.deepseek.com/v1";
-const model = process.env.MODEL || "deepseek/deepseek-v4-flash";
+const baseUrl = process.env.BASE_URL || "https://opencode.ai/zen/go/v1";
+const model = process.env.MODEL || "go/deepseek-v4-flash";
 const slash = model.indexOf("/");
 const providerName = slash === -1 ? "deepseek" : model.slice(0, slash);
 const modelName = slash === -1 ? model : model.slice(slash + 1);
@@ -53,6 +53,11 @@ const config = {
         write: "deny",
         bash: "deny",
         webfetch: "allow",
+        // The diff + existing_threads.json live in the runner's temp scratch
+        // dir (outside the repo), so the read-only agent must be allowed to
+        // read them. It stays unable to write, edit, or execute anything.
+        read: "allow",
+        external_directory: "allow",
       },
       prompt,
     },

@@ -7,8 +7,8 @@ so unresolved threads block merge.
 
 No external review SaaS. The review is performed by an **opencode** agent
 (read-only, provider-agnostic) and the thread lifecycle is handled by a small
-deterministic Node script. You bring your own provider API key (DeepSeek by
-default, but any OpenAI-compatible endpoint works).
+deterministic Node script. You bring your own provider API key (OpenCode Go by
+default, but any OpenAI-compatible endpoint works — set `base-url` and `model`).
 
 ## How it works
 
@@ -44,7 +44,8 @@ issue is gone. If a dev replies and resolves a thread manually, the agent
 ## Quick start (consumer repo)
 
 1. Add a secret for your provider key, e.g. `DEEPSEEK_API_KEY` (Settings →
-   Secrets and variables → Actions).
+   Secrets and variables → Actions). For the default OpenCode Go provider this
+   is the key from your opencode config (`provider.go.options.apiKey`).
 2. Add the workflow (copy `example/.github/workflows/code-review.yml`):
 
    ```yaml
@@ -84,8 +85,8 @@ The action posts inline threads as `github-actions[bot]`. It needs
 | --- | --- | --- | --- |
 | `api-key` | yes | — | Provider API key for the opencode analyzer (e.g. `DEEPSEEK_API_KEY` secret). |
 | `github-token` | no | `github.token` | Token with `pull-requests: write` and `contents: read`. |
-| `base-url` | no | `https://api.deepseek.com/v1` | Provider endpoint (OpenAI-compatible). |
-| `model` | no | `deepseek/deepseek-v4-flash` | `provider/model` for the analyzer. Adjust to the exact model your provider exposes (e.g. `deepseek-chat`). |
+| `base-url` | no | `https://opencode.ai/zen/go/v1` | Provider endpoint (OpenAI-compatible). |
+| `model` | no | `go/deepseek-v4-flash` | `provider/model` for the analyzer. Adjust to the exact model your provider exposes. |
 | `diff-scope` | no | `""` | Extra comma-separated gitignore-style patterns to exclude from review. |
 | `set-status` | no | `false` | Set a commit status: `failure` while unresolved Critical/Warning threads remain, else `success`. |
 

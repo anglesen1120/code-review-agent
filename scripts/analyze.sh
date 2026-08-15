@@ -31,8 +31,8 @@ if [ -f "$SCRATCH/env" ]; then
   . "$SCRATCH/env"
 fi
 
-MODEL="${MODEL:-deepseek/deepseek-v4-flash}"
-BASE_URL="${BASE_URL:-https://api.deepseek.com/v1}"
+MODEL="${MODEL:-go/deepseek-v4-flash}"
+BASE_URL="${BASE_URL:-https://opencode.ai/zen/go/v1}"
 API_KEY_ENV="${API_KEY_ENV:-DEEPSEEK_API_KEY}"
 
 # Local mode: if no diff was provided, review working-tree changes vs HEAD.
@@ -82,6 +82,10 @@ if node "$ACTION_PATH/scripts/parse-events.js" "$SCRATCH/events.retry.jsonl" "$S
 fi
 
 echo "code-review-agent: analysis produced invalid findings; degrading." >&2
+echo "--- opencode stderr (tail) ---" >&2
+tail -25 "$SCRATCH/opencode.err" 2>/dev/null >&2 || true
+echo "--- opencode events (tail) ---" >&2
+tail -8 "$SCRATCH/events.jsonl" 2>/dev/null >&2 || true
 echo '{"summary":"Analysis failed to produce valid findings. See workflow logs.","findings":[]}' >"$SCRATCH/findings.json"
 echo "analysis_error=1" >"$SCRATCH/error"
 exit 0

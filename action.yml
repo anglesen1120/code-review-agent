@@ -18,11 +18,11 @@ inputs:
   base-url:
     description: "Provider endpoint base URL (OpenAI-compatible)."
     required: false
-    default: "https://api.deepseek.com/v1"
+    default: "https://opencode.ai/zen/go/v1"
   model:
-    description: "Provider/model for the analyzer, e.g. deepseek/deepseek-v4-flash."
+    description: "Provider/model for the analyzer, e.g. go/deepseek-v4-flash."
     required: false
-    default: "deepseek/deepseek-v4-flash"
+    default: "go/deepseek-v4-flash"
   diff-scope:
     description: "Extra comma-separated gitignore-style patterns to exclude from review."
     required: false
