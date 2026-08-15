@@ -1,0 +1,32 @@
+{
+  "summary": "The PR adds a search endpoint to OrderService. One critical SQL injection risk and a missing null check were found; the rest are minor.",
+  "findings": [
+    {
+      "severity": "Critical",
+      "category": "security",
+      "file": "src/App/Orders/OrderService.cs",
+      "line": 42,
+      "title": "SQL injection via string concatenation",
+      "description": "The search term is interpolated directly into the query string, allowing SQL injection.",
+      "suggestion": "Use parameterized queries or an ORM (e.g. EF Core) instead of string interpolation."
+    },
+    {
+      "severity": "Warning",
+      "category": "bug",
+      "file": "src/App/Orders/OrderService.cs",
+      "line": 18,
+      "title": "Missing null check on request payload",
+      "description": "request.CustomerId may be null and would throw a NullReferenceException when used.",
+      "suggestion": "Guard with a null check and return a 400 response."
+    },
+    {
+      "severity": "Info",
+      "category": "style",
+      "file": "src/App/Orders/OrderService.cs",
+      "line": 5,
+      "title": "Consider extracting magic string",
+      "description": "The literal 'pending' is used in multiple places in this file.",
+      "suggestion": "Define a const or enum for order statuses."
+    }
+  ]
+}

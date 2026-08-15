@@ -1,0 +1,4 @@
+node_modules/
+.review/
+findings.json
+*.log

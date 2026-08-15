@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CodeReviewAgentFindings",
+  "type": "object",
+  "required": ["summary", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "2-4 sentence overall assessment of the PR."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Review findings. Only changed (added/modified) lines may be anchored.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "category", "file", "line", "title", "description", "suggestion"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["Critical", "Warning", "Info"]
+          },
+          "category": {
+            "type": "string",
+            "enum": ["security", "bug", "performance", "design", "test", "style", "maintainability", "dependency", "docs", "other"]
+          },
+          "file": {
+            "type": "string",
+            "description": "Repo-relative path, e.g. src/App/Orders/OrderService.cs. Must be a file in the PR diff."
+          },
+          "line": {
+            "type": "integer",
+            "description": "1-based line number in the NEW version of the file, inside the diff hunk."
+          },
+          "startLine": {
+            "type": "integer",
+            "description": "Optional 1-based start of the range (>= line)."
+          },
+          "endLine": {
+            "type": "integer",
+            "description": "Optional 1-based end of the range (>= line)."
+          },
+          "title": {
+            "type": "string",
+            "description": "Imperative headline <= 80 chars."
+          },
+          "description": {
+            "type": "string",
+            "description": "2-6 sentences: why it matters, impact, when it triggers."
+          },
+          "suggestion": {
+            "type": "string",
+            "description": "Concrete fix with a code snippet when useful."
+          }
+        }
+      }
+    }
+  }
+}

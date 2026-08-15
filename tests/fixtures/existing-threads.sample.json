@@ -1,0 +1,29 @@
+{
+  "botLogin": "github-actions[bot]",
+  "threads": [
+    {
+      "id": "RTE_1",
+      "key": "src/App/Orders/OrderService.cs:42:sql injection via string concatenation",
+      "path": "src/App/Orders/OrderService.cs",
+      "line": 42,
+      "isResolved": false,
+      "isOutdated": false
+    },
+    {
+      "id": "RTE_2",
+      "key": "src/App/Orders/OrderService.cs:18:missing null check on request payload",
+      "path": "src/App/Orders/OrderService.cs",
+      "line": 18,
+      "isResolved": false,
+      "isOutdated": true
+    },
+    {
+      "id": "RTE_3",
+      "key": "src/App/Orders/OrderService.cs:30:async void handler",
+      "path": "src/App/Orders/OrderService.cs",
+      "line": 30,
+      "isResolved": true,
+      "isOutdated": false
+    }
+  ]
+}

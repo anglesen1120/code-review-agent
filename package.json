@@ -1,0 +1,13 @@
+{
+  "name": "code-review-agent",
+  "version": "0.1.0",
+  "description": "Self-contained CodeRabbit-like code review agent. opencode analyzer + deterministic GitHub thread poster.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\""
+  }
+}
