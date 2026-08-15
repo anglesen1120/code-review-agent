@@ -83,9 +83,9 @@ fi
 
 echo "code-review-agent: analysis produced invalid findings; degrading." >&2
 echo "--- opencode stderr (tail) ---" >&2
-tail -25 "$SCRATCH/opencode.err" 2>/dev/null >&2 || true
+tail -25 "$SCRATCH/opencode.err" >&2 2>/dev/null || true
 echo "--- opencode events (tail) ---" >&2
-tail -8 "$SCRATCH/events.jsonl" 2>/dev/null >&2 || true
+tail -8 "$SCRATCH/events.jsonl" >&2 2>/dev/null || true
 echo '{"summary":"Analysis failed to produce valid findings. See workflow logs.","findings":[]}' >"$SCRATCH/findings.json"
 echo "analysis_error=1" >"$SCRATCH/error"
 exit 0

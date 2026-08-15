@@ -119,6 +119,4 @@ runs:
         SET_STATUS: ${{ inputs.set-status }}
         RUNNER_TEMP: ${{ runner.temp }}
       run: |
-        echo "apply: RUNNER_TEMP=$RUNNER_TEMP PR_NUMBER=$PR_NUMBER"
-        ls -la "$RUNNER_TEMP/cra/" 2>&1 | head -20
         node "${{ github.action_path }}/scripts/post-review.js" apply
