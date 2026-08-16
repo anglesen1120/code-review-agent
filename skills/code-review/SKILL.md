@@ -6,9 +6,9 @@ description: Review the current code changes with the self-contained code-review
 # Code Review (opencode)
 
 Reviews the current changes using the `code-review-agent` project. The analysis
-is performed by the **opencode** agent (`code-reviewer`, read-only, DeepSeek
-provider); Claude Code orchestrates the run and presents the results. This is
-the same engine the GitHub Action uses in CI.
+is performed by the **opencode** agent (`code-reviewer`, read-only, OpenCode Go
+provider by default); Claude Code orchestrates the run and presents the
+results. This is the same engine the GitHub Action uses in CI.
 
 ## Locate the agent repo
 

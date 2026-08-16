@@ -10,6 +10,17 @@ No external review SaaS. The review is performed by an **opencode** agent
 deterministic Node script. You bring your own provider API key (OpenCode Go by
 default, but any OpenAI-compatible endpoint works — set `base-url` and `model`).
 
+## Documentation
+
+| Doc | What it covers |
+| --- | --- |
+| [Setup](docs/SETUP.md) | Full consumer setup: classic PAT, secrets, workflow, branch protection. |
+| [Architecture](docs/ARCHITECTURE.md) | Two-stage design, data flow, security model, degrade paths. |
+| [Thread lifecycle](docs/THREAD-LIFECYCLE.md) | The merge gate, delta algorithm, dedupe, resolve rules. |
+| [E2E results](docs/E2E-RESULTS.md) | End-to-end verification against a real repo with planted bugs. |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Common problems and how to diagnose them. |
+| [Development](docs/DEVELOPMENT.md) | Tests, local dry-run, the local skill. |
+
 ## How it works
 
 Two stages:
@@ -112,7 +123,7 @@ but nobody (agent included) can auto-resolve them from CI.
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
 | `api-key` | yes | — | Provider API key for the opencode analyzer (e.g. `DEEPSEEK_API_KEY` secret). |
-| `github-token` | no | `github.token` | Token with `pull-requests: write` and `contents: read`. |
+| `github-token` | no | `github.token` | Token with `pull-requests: write`. A **classic PAT (`repo` scope)** is required for auto-resolve (see [Setup](docs/SETUP.md)). |
 | `base-url` | no | `https://opencode.ai/zen/go/v1` | Provider endpoint (OpenAI-compatible). |
 | `model` | no | `go/deepseek-v4-flash` | `provider/model` for the analyzer. Adjust to the exact model your provider exposes. |
 | `diff-scope` | no | `""` | Extra comma-separated gitignore-style patterns to exclude from review. |
@@ -162,8 +173,8 @@ supports a fix-review cycle with approval.
   algorithm; no network, no LLM).
 - Local dry-run — run `analyze.sh` as above and inspect `findings.json` (only
   added/modified lines should be referenced).
-- E2E — a throwaway GitHub repo with a planted bug; see "Merge gating" scenario
-  above.
+- E2E — a throwaway GitHub repo with planted bugs; see
+  [docs/E2E-RESULTS.md](docs/E2E-RESULTS.md) for the scenario and assertions.
 
 ## Risks & limitations
 
