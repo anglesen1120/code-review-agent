@@ -314,7 +314,7 @@ async function cmdApply() {
   const existing = readJSON(scratch("existing_threads.json")) ?? { threads: [] };
   const changedFiles = readJSON(scratch("changed_files.json")) ?? [];
 
-  const { toPost, toResolve, unresolvedCount, counts } = computeDelta(
+  const { toPost, toResolve, counts } = computeDelta(
     findingsData.findings,
     existing.threads ?? [],
     changedFiles,
@@ -342,14 +342,26 @@ async function cmdApply() {
     }
   }
 
+  let resolved = 0;
   for (const t of toResolve) {
     try {
       await resolveThread(t.id);
+      resolved += 1;
     } catch (e) {
       console.error(`post-review: could not resolve thread ${t.id}: ${e.message}`);
     }
     await sleep(300);
   }
+
+  // Recompute the true open count from actual outcomes so the summary's
+  // merge-gate note is honest even when some API calls fail (e.g. a token that
+  // can post threads but cannot resolve them — a known fine-grained PAT /
+  // GITHUB_TOKEN limitation).
+  const toResolveIds = new Set(toResolve.map((t) => t.id));
+  const stillOpenExisting = existing.threads.filter(
+    (t) => !t.isResolved && !toResolveIds.has(t.id),
+  ).length;
+  const unresolvedCount = stillOpenExisting + (toResolve.length - resolved) + posted;
 
   const summaryBody = markdownSummary({
     summary: findingsData.summary,
@@ -391,7 +403,7 @@ async function cmdApply() {
     });
   }
 
-  console.log(`post-review: posted ${toPost.length}, resolved ${toResolve.length}, unresolved ${unresolvedCount}`);
+  console.log(`post-review: posted ${posted}, resolved ${resolved}, unresolved ${unresolvedCount}`);
   setOutput("findings-count", String(findingsData.findings.length));
   setOutput("unresolved-count", String(unresolvedCount));
   setOutput("review-id", String(reviewId ?? ""));
