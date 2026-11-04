@@ -114,25 +114,38 @@ function hasCommit(ref, cwd) {
   }
 }
 
-// Plain ref names only: `git fetch` parses options after the remote too, so a
-// ref that reaches argv could be read as `--upload-pack=<helper>` (arbitrary
-// execution) or as an `a:b` refspec (writes a local ref).
-const FETCH_REF_RE = /^[A-Za-z0-9._/-]+$/;
+// A fetch argument must not be an option (`-x`) or a refspec (`a:b`, `+a`):
+// `git fetch` parses options after the remote and a refspec can write a local
+// ref. Everything else stays allowed, including `+`, `@` and Unicode names.
+const unsafeFetchRef = (target) => (
+  !target || target.startsWith("-") || target.startsWith("+") || /[\s\u0000-\u001f\u007f-\u009f:\\]/.test(target)
+);
 
 /** Shallow CI clones (GitLab GIT_DEPTH, checkout fetch-depth 1) may lack the base. */
 export function ensureCommits(refs, cwd, log) {
-  const missing = refs.filter((r) => r && !hasCommit(r, cwd));
-  if (missing.length === 0) return;
-  const targets = missing.map((r) => r.replace(/^origin\//, ""));
-  targets.forEach((target, i) => {
-    if (target.startsWith("-") || !FETCH_REF_RE.test(target)) {
-      throw new Error(`cannot fetch '${missing[i]}': not a plain ref name`);
+  // Validate first: `hasCommit` also runs git, with `${ref}^{commit}` as argv.
+  const targets = refs.map((r) => (r ? r.replace(/^origin\//, "") : r));
+  refs.forEach((ref, i) => {
+    if (ref && unsafeFetchRef(targets[i])) {
+      throw new Error(`cannot fetch '${ref}': not a plain ref name`);
     }
   });
+  const missing = refs.filter((r) => r && !hasCommit(r, cwd));
+  if (missing.length === 0) return;
   log(`code-review-agent: fetching ${missing.join(", ")}`);
   try {
-    // `--` ends option parsing: nothing after it can be a git flag.
-    git(["fetch", "--no-tags", "--", "origin", ...targets], cwd);
+    for (const ref of missing) {
+      const target = ref.replace(/^origin\//, "");
+      // `--` ends option parsing: nothing after it can be a git flag.
+      git(["fetch", "--no-tags", "--", "origin", target], cwd);
+      // `git fetch <remote> <ref>` only writes FETCH_HEAD, so `origin/<ref>`
+      // would still be unresolvable and the diff would fail right after this.
+      if (ref.startsWith("origin/")) {
+        // --no-deref: `origin/HEAD` is a symref, and following it would rewrite
+        // refs/remotes/origin/<default branch> instead of the ref we resolved.
+        git(["update-ref", "--no-deref", `refs/remotes/origin/${target}`, "FETCH_HEAD"], cwd);
+      }
+    }
   } catch (e) {
     throw new Error(`cannot fetch ${missing.join(", ")} (use a full clone / fetch-depth: 0): ${e.stderr || e.message}`);
   }

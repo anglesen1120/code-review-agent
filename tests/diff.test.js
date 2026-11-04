@@ -237,6 +237,22 @@ test("gitDiff pins a/ b/ prefixes even when the repo sets diff.noprefix", (t) =>
   assert.equal(first.length, 40);
 });
 
+test("gitDiff ignores .gitattributes that would turn the diff binary", (t) => {
+  const { dir, git, head } = repo();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const base = head;
+  writeFileSync(join(dir, ".gitattributes"), "*.txt -diff\n");
+  writeFileSync(join(dir, "a.txt"), "one\ntwo\nthree\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "hide");
+  const tip = git("rev-parse", "HEAD").trim();
+  const { diff, changedFiles } = gitDiff({ base, head: tip, cwd: dir });
+  assert.ok(changedFiles.includes("a.txt"));
+  assert.doesNotMatch(diff, /^Binary files .* differ$/m, "the PR cannot hide content as binary");
+  assert.match(diff, /^\+three$/m);
+  assert.match(diff, /^\+\*\.txt -diff$/m, ".gitattributes itself is reviewed too");
+});
+
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "cra-diff-"));
   const git = (...args) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: dir, encoding: "utf8" });
@@ -361,4 +377,33 @@ test("snapshotTree removes symlinks and refuses a non-empty destination", (t) =>
   writeFileSync(join(dest, "keep.txt"), "x\n");
   assert.throws(() => snapshotTree({ rev, cwd: dir, dest }), /not empty/);
   assert.equal(readFileSync(join(dest, "keep.txt"), "utf8"), "x\n", "a refused destination is not modified");
+});
+
+test("snapshotTree never lets a tree-supplied .git reach the snapshot", (t) => {
+  const { dir } = repo();
+  const g = (args, input) => execFileSync(
+    "git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...args],
+    { cwd: dir, input, encoding: "utf8" },
+  ).trim();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // A tree entry named `.git` (git mktree accepts it; push may not on every host).
+  const blob = g(["hash-object", "-w", "--stdin"], "[core]\n\tfsmonitor = /tmp/canary\n");
+  const configTree = g(["mktree"], `100644 blob ${blob}\tconfig\n`);
+  const dotGit = g(["mktree"], `040000 tree ${configTree}\t.git\n`);
+  // Nested `.git` entries must be refused too, not just the top-level one.
+  const nested = g(["mktree"], `040000 tree ${dotGit}\tsub\n`);
+  const revs = [
+    g(["commit-tree", dotGit, "-m", "evil"]),
+    g(["commit-tree", nested, "-m", "evil nested"]),
+  ];
+
+  for (const rev of revs) {
+    const dest = mkdtempSync(join(tmpdir(), "cra-snap-"));
+    t.after(() => rmSync(dest, { recursive: true, force: true }));
+    // `git archive` refuses the path outright; the snapshot must not exist either way.
+    assert.throws(() => snapshotTree({ rev, cwd: dir, dest }), /invalid path|failed to unpack/, rev);
+    assert.equal(existsSync(join(dest, ".git")), false);
+    assert.equal(existsSync(join(dest, "sub", ".git")), false);
+    assert.deepEqual(readdirSync(dest), []);
+  }
 });

@@ -203,6 +203,12 @@ export function assertRevision(name, value) {
 // the canonical a/ b/ prefixes, so pin them for every diff we produce.
 const PREFIX_OPTS = ["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false"];
 
+// `--text`: a PR can commit `.gitattributes` (`* -diff` / `binary`) and turn the
+// whole diff into "Binary files … differ", blinding the review without any
+// prompt injection. `--no-ext-diff`/`--no-textconv` keep configured drivers out
+// of the output. The byte budget (capDiff) still bounds binary payloads.
+const DIFF_OPTS = ["--no-color", "-U5", "--text", "--no-ext-diff", "--no-textconv"];
+
 const pathspec = (pattern) => (
   // Git pathspecs do not match root-level `dist/x` with `**/dist/**`, so emit
   // the root-anchored variant too; the intent of the action's list is "anywhere".
@@ -220,7 +226,7 @@ export function gitDiff({ base, head, excludes = [], cwd } = {}) {
   assertRevision("base", base);
   assertRevision("head", head);
   const scope = [`${base}...${head}`, "--", ".", ...excludedPaths(excludes)];
-  const diff = git([...PREFIX_OPTS, "diff", "--no-color", "-U5", ...scope], cwd);
+  const diff = git([...PREFIX_OPTS, "diff", ...DIFF_OPTS, ...scope], cwd);
   const changedFiles = git([...PREFIX_OPTS, "diff", "--name-only", "-z", ...scope], cwd).split("\0").filter(Boolean);
   return { diff, changedFiles };
 }
@@ -232,7 +238,7 @@ export function gitDiff({ base, head, excludes = [], cwd } = {}) {
 export function workingTreeDiff({ cwd, excludes = [] } = {}) {
   const scope = ["HEAD", "--", ".", ...excludedPaths(excludes)];
   return {
-    diff: git([...PREFIX_OPTS, "diff", "--no-color", "-U5", ...scope], cwd),
+    diff: git([...PREFIX_OPTS, "diff", ...DIFF_OPTS, ...scope], cwd),
     changedFiles: git([...PREFIX_OPTS, "diff", "--name-only", "-z", ...scope], cwd).split("\0").filter(Boolean),
   };
 }
@@ -276,6 +282,12 @@ export function snapshotTree({ rev, cwd, dest } = {}) {
     rmSync(tarPath, { force: true });
   }
   const symlinksRemoved = removeSymlinks(dest);
+  // An archive entry named `.git` would make `git init` reuse attacker-supplied
+  // config (core.fsmonitor, core.sshCommand, hooks). Git blocks such paths on
+  // push, but other hosts are not guaranteed to; never trust the tree.
+  for (const entry of readdirSync(dest)) {
+    if (entry.toLowerCase() === ".git") rmSync(join(dest, entry), { recursive: true, force: true });
+  }
   execFileSync("git", ["init", "-q"], { cwd: dest, stdio: ["ignore", "ignore", "pipe"] });
   return { dir: dest, symlinksRemoved };
 }

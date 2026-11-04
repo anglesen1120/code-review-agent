@@ -149,6 +149,14 @@ const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})\s*$/;
 
 /**
+ * Mirror GitLab's extractor, which deletes every `\r` from a comment body
+ * before scanning for quick actions (`content.delete!("\r")`). A bare `\r`
+ * before `/approve` would otherwise look like a mid-line slash to us while
+ * GitLab sees a line-leading one.
+ */
+const normalizeNewlines = (text) => String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "");
+
+/**
  * CommonMark fence opener, or null. An info string after a backtick fence may
  * not contain a backtick (§4.5), so "``` bad`info" is an ordinary paragraph and
  * must NOT be treated as a fence — otherwise the paragraph after it would be
@@ -196,9 +204,15 @@ function closingFenceFor(text) {
  * `@Override` must stay copy-pasteable). Because an unterminated fence would
  * swallow the thread/summary marker that follows, an open fence at the end of
  * the text gets a closing fence line appended.
+ *
+ * Two desyncs are closed up front: `\r` is deleted exactly as GitLab's extractor
+ * does (so `"\r/approve"` is a line-leading action for both), and a line-leading
+ * `<` outside a fence is escaped so model text cannot open an HTML block — which
+ * would make GitLab treat a following fence line as paragraph text while this
+ * tracker treats it as code.
  */
 export function sanitize(text) {
-  const lines = String(text ?? "")
+  const lines = normalizeNewlines(text)
     .replace(CONTROL_CHARS, "")
     .replace(/<!--/g, "&lt;!--")
     .split("\n");
@@ -222,9 +236,14 @@ export function sanitize(text) {
   return out.join("\n");
 }
 
-/** Break @mentions and a line-leading `/` (GitLab quick action) on one plain line. */
+/**
+ * Break @mentions, a line-leading `/` (GitLab quick action) and a line-leading
+ * `<` (which could otherwise open a CommonMark HTML block and desync fence
+ * tracking) on one plain line.
+ */
 function neutralizeLine(line) {
   return line
+    .replace(/^( {0,3})</, "$1&lt;")
     .replace(/(^|[^\w`])@(?=[A-Za-z0-9])/g, "$1@\u200b")
     .replace(/^([ \t]*)\//, "$1\u200b/");
 }
@@ -241,7 +260,7 @@ export function inlineText(text) {
  * never need copy-pasteable code — and still close an unterminated fence.
  */
 function sanitizeMetadata(text) {
-  const body = String(text ?? "")
+  const body = normalizeNewlines(text)
     .replace(CONTROL_CHARS, "")
     .replace(/<!--/g, "&lt;!--")
     .split("\n")

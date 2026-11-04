@@ -455,3 +455,49 @@ test("markdownSummary caps the body below the GitLab/GitHub comment limit", () =
   assert.ok(md.startsWith("<!-- code-review-agent:summary -->"));
   assert.equal(parseReviewedSha(md), "abc1234");
 });
+
+// ---- CR and HTML-block desyncs (GitLab extractor parity) ----
+
+const rawQuickActions = (text) => {
+  const found = [];
+  let fence = null;
+  for (const line of String(text).split("\n")) {
+    if (fence) {
+      const close = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.length) fence = null;
+      continue;
+    }
+    const open = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (open && !open[2].includes(open[1][0])) {
+      fence = { char: open[1][0], length: open[1].length };
+      continue;
+    }
+    if (/^[ \t]*\//.test(line)) found.push(line);
+  }
+  return found;
+};
+
+test("carriage returns are deleted like GitLab's extractor before neutralizing", () => {
+  // GitLab deletes every \r, so "\r/approve" is a line-leading quick action.
+  assert.deepEqual(quickActionLines(sanitize("\r/approve")), []);
+  assert.equal(sanitize("\r/approve"), "\u200b/approve");
+  // "a\r/approve" collapses to the single line "a/approve": mid-line, inert for both sides.
+  assert.equal(sanitize("a\r/approve"), "a/approve");
+  assert.equal(sanitize("a\r\n/merge"), "a\n\u200b/merge");
+  assert.equal(sanitize("a\r\nb\r/close"), "a\nb/close");
+  assert.deepEqual(quickActionLines(sanitize("x\r\r/approve")), []);
+  const body = markdownThread(F({ description: "\r/approve", suggestion: "\r\n/merge" }));
+  assert.deepEqual(quickActionLines(body), []);
+  assert.deepEqual(rawQuickActions(body), []);
+});
+
+test("a line-leading '<' is escaped so an HTML block cannot desync fence tracking", () => {
+  const s = sanitize("<div>\n```\n</div>\n/approve");
+  assert.ok(s.startsWith("&lt;div>"));
+  // The fence is now real for GitLab too, so /approve is inside a code block.
+  assert.deepEqual(rawQuickActions(s), []);
+  // Without a fence there is nothing to hide behind: neutralized outright.
+  assert.match(sanitize("<div>\n</div>\n/approve"), /\n\u200b\/approve/);
+  // Inside a fence the line stays byte-identical (code, not HTML).
+  assert.equal(sanitize("```\n<div>\n```"), "```\n<div>\n```");
+});

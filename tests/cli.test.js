@@ -418,7 +418,8 @@ test("safeConsole strips C1 controls, bidi overrides and TeamCity commands", () 
   // Unterminated OSC must not rescan the rest of the message per ESC.
   const started = Date.now();
   safeConsole("\u001b]".repeat(200_000));
-  assert.ok(Date.now() - started < 1000, "no quadratic rescan");
+  // Linear is ~ms; a quadratic rescan of 200k ESC] takes minutes. 5 s tolerates loaded runners.
+  assert.ok(Date.now() - started < 5000, "no quadratic rescan");
 });
 
 test("an unexpected throw exits 2 with sanitized stderr", () => {
@@ -435,7 +436,7 @@ test("an unexpected throw exits 2 with sanitized stderr", () => {
   assert.match(res.stderr, /\u200b::add-mask::secret/);
 });
 
-/** Local "origin" (branch feature at c2, main at c3) and a shallow clone of it. */
+/** Local "origin": feature, plus/foo+bar and user@fix each at a different commit. */
 function makeOrigin() {
   const origin = mkdtempSync(join(tmpdir(), "cra-origin-"));
   git(origin, "init", "-q", "-b", "main");
@@ -447,13 +448,23 @@ function makeOrigin() {
   git(origin, "checkout", "-qb", "feature");
   writeFileSync(join(origin, "f.js"), "f\n");
   git(origin, "add", ".");
-  git(origin, "commit", "-qm", "c2");
+  git(origin, "commit", "-qm", "feature");
   const featureSha = git(origin, "rev-parse", "HEAD");
+  git(origin, "checkout", "-qb", "plus/foo+bar");
+  writeFileSync(join(origin, "plus.js"), "plus\n");
+  git(origin, "add", ".");
+  git(origin, "commit", "-qm", "plus");
+  const plusSha = git(origin, "rev-parse", "HEAD");
+  git(origin, "checkout", "-qb", "user@fix");
+  writeFileSync(join(origin, "user.js"), "user\n");
+  git(origin, "add", ".");
+  git(origin, "commit", "-qm", "user");
+  const userSha = git(origin, "rev-parse", "HEAD");
   git(origin, "checkout", "-q", "main");
   writeFileSync(join(origin, "b.js"), "b\n");
   git(origin, "add", ".");
-  git(origin, "commit", "-qm", "c3");
-  return { origin, featureSha };
+  git(origin, "commit", "-qm", "main tip");
+  return { origin, featureSha, plusSha, userSha };
 }
 
 function shallowClone(origin) {
@@ -462,7 +473,7 @@ function shallowClone(origin) {
   return work;
 }
 
-test("a ref can never reach git fetch as an option", (t) => {
+test("a ref can never reach git fetch as an option", async (t) => {
   const { origin } = makeOrigin();
   const work = shallowClone(origin);
   const canaryDir = mkdtempSync(join(tmpdir(), "cra-canary-"));
@@ -479,28 +490,40 @@ test("a ref can never reach git fetch as an option", (t) => {
     () => ensureCommits([`origin/--upload-pack=${canary}`], work, (m) => logs.push(m)),
     /not a plain ref name/,
   );
+  // Validation runs before any git call: option-like and refspec-like input never reaches argv.
+  for (const bad of ["--path=/tmp/x", "origin/main:refs/heads/main", "origin/+main", "origin/a b"]) {
+    assert.throws(() => ensureCommits([bad], work, (m) => logs.push(m)), /not a plain ref name/, bad);
+  }
   assert.equal(existsSync(marker), false, "upload-pack helper never ran");
   assert.doesNotMatch(logs.join("\n"), /fetching/, "git was never called");
 
   // The same ref through the CLI exits 2 without running the helper.
   const cliLogs = [];
-  const code = await2(run(["review", "--platform", "none", "--base", `origin/--upload-pack=${canary}`, "--out-dir",
+  const code = await run(["review", "--platform", "none", "--base", `origin/--upload-pack=${canary}`, "--out-dir",
     mkdtempSync(join(tmpdir(), "cra-out-"))], {
     env: { PATH: process.env.PATH }, cwd: work, log: (m) => cliLogs.push(m), out: () => {},
-  }));
+  });
   assert.equal(code, 2);
   assert.equal(existsSync(marker), false);
   assert.match(cliLogs.join("\n"), /not a plain ref name/);
 });
 
-test("ensureCommits still fetches a legitimate missing ref through --", (t) => {
-  const { origin, featureSha } = makeOrigin();
+test("ensureCommits still fetches legitimate refs through --", (t) => {
+  const { origin, featureSha, plusSha, userSha } = makeOrigin();
   const work = shallowClone(origin);
   t.after(() => {
     for (const p of [origin, work]) rmSync(p, { recursive: true, force: true });
   });
-  const logs = [];
-  ensureCommits(["origin/feature"], work, (m) => logs.push(m));
-  assert.match(logs.join("\n"), /fetching origin\/feature/);
-  assert.equal(git(work, "rev-parse", "FETCH_HEAD"), featureSha, "the fetch really ran");
+  // Distinct tips: a skipped or misdirected fetch leaves the old FETCH_HEAD and fails.
+  assert.equal(new Set([featureSha, plusSha, userSha]).size, 3, "fixture branches differ");
+  const cases = [["origin/feature", featureSha], ["origin/plus/foo+bar", plusSha], ["origin/user@fix", userSha]];
+  for (const [name, sha] of cases) {
+    const logs = [];
+    ensureCommits([name], work, (m) => logs.push(m));
+    assert.match(logs.join("\n"), /fetching /);
+    // The ref the caller asked for must now resolve to its own tip; FETCH_HEAD alone
+    // would leave `--base origin/<branch>` unresolvable and the diff would fail.
+    assert.equal(git(work, "rev-parse", "--verify", `${name}^{commit}`), sha, `${name} resolves after the fetch`);
+    assert.equal(git(work, "rev-parse", "FETCH_HEAD"), sha, `${name} fetched its own tip`);
+  }
 });
