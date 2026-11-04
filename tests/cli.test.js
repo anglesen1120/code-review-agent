@@ -508,6 +508,22 @@ test("a ref can never reach git fetch as an option", async (t) => {
   assert.match(cliLogs.join("\n"), /not a plain ref name/);
 });
 
+test("fetching origin/HEAD never dereferences its symref", (t) => {
+  const { origin } = makeOrigin();
+  const work = shallowClone(origin);
+  t.after(() => {
+    for (const p of [origin, work]) rmSync(p, { recursive: true, force: true });
+  });
+  // A dangling symref makes origin/HEAD unresolvable, so it gets fetched.
+  git(work, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/ghost");
+  const mainSha = git(work, "rev-parse", "refs/remotes/origin/main");
+  ensureCommits(["origin/HEAD"], work, () => {});
+  assert.equal(git(work, "rev-parse", "--verify", "refs/remotes/origin/HEAD"), mainSha, "ref resolves");
+  assert.throws(() => git(work, "rev-parse", "--verify", "refs/remotes/origin/ghost"),
+    "the symref target was not created");
+  assert.equal(git(work, "rev-parse", "refs/remotes/origin/main"), mainSha);
+});
+
 test("ensureCommits still fetches legitimate refs through --", (t) => {
   const { origin, featureSha, plusSha, userSha } = makeOrigin();
   const work = shallowClone(origin);
