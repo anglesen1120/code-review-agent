@@ -1,0 +1,40 @@
+# Merge-request code review for GitLab CI. Include it from any project:
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/anglesen1120/code-review-agent/main/ci/gitlab/code-review.gitlab-ci.yml'
+#   # or, from a mirrored copy:
+#   #   - project: 'my-group/code-review-agent'
+#   #     file: 'ci/gitlab/code-review.gitlab-ci.yml'
+#     ref: main
+#
+# Masked CI/CD variables (Settings -> CI/CD -> Variables):
+#   CRA_API_KEY   provider key for the analyzer (CRA_API_KEY)
+#   GITLAB_TOKEN  project/group access token, role Developer or higher, scope `api`.
+#                 CI_JOB_TOKEN cannot create or resolve MR discussions.
+#
+# Merge gate: the job exits 1 only if you add --fail-on; the inline MR threads
+# block merge only when the project enables
+# "Merge requests -> All threads must be resolved".
+
+code-review:
+  stage: test
+  image:
+    name: ghcr.io/anglesen1120/code-review-agent:latest
+    entrypoint: [""] # the image entrypoint is `cra`; the script needs a shell
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    GIT_DEPTH: "0" # the diff base SHA must be reachable
+  script:
+    - cra review --platform gitlab --codequality gl-code-quality-report.json --sarif gl-sast-cra.sarif --markdown cra-report.md
+  artifacts:
+    when: always
+    paths:
+      - cra-report.md
+      - gl-sast-cra.sarif
+    reports:
+      codequality: gl-code-quality-report.json
+  # Reviews are advisory until you trust the model on this repo; remove this
+  # line (or set it to false) to make a failed run block the pipeline.
+  allow_failure: true
+  interruptible: true

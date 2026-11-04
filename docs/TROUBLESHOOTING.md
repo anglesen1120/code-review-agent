@@ -1,106 +1,178 @@
 # Troubleshooting
 
-Common problems and how to diagnose them. When in doubt, open the workflow run
-log and search for `post-review:` and `##[error]` lines.
+Common problems and how to diagnose them. Start with the job log: the CLI logs
+under the `cra:` prefix, the analyzer prints an `opencode stderr (tail)` and
+`opencode events (tail)` block after its second failed attempt, and the summary
+comment carries a `Notes` section listing skipped files, dropped findings and
+posting failures.
 
-## "Unable to resolve action `anglesen1120/code-review-agent`"
+## Exit codes
 
-The action repository must be **public** for `uses: anglesen1120/code-review-agent@v1`
-to work from any repo. A private action repo can only be used from repos in the
-same owner/org on a paid plan. Make `code-review-agent` public, or publish the
-action elsewhere.
+| Exit | Likely cause |
+| --- | --- |
+| `0` | Review completed; `--fail-on` did not match (or is `none`). |
+| `1` | Open issue matched `--fail-on`, the analysis failed while `--fail-on` is set, no thread could be posted at all, or existing threads could not be read. |
+| `2` | Usage/configuration: unknown flag value, no base revision, missing platform token or MR/PR context, unreadable event payload. |
+
+## `Unable to resolve action anglesen1120/code-review-agent`
+
+The action repository must be **public** for
+`uses: anglesen1120/code-review-agent@v1` to work from any repo. A private
+action repo can only be used from repos in the same owner/org on a paid plan.
+Make it public, or publish the action elsewhere (or use the Docker image).
 
 ## `Resource not accessible by integration` (HTTP 403) on resolve
 
-The built-in `GITHUB_TOKEN` (the `github-actions` app) can post threads but
-**cannot resolve them**. This is a GitHub platform restriction. To enable
-auto-resolve, supply a **classic PAT with the `repo` scope** via `github-token`
-and set `bot-login` to that account's username. See
-[`docs/SETUP.md`](SETUP.md).
+The built-in `GITHUB_TOKEN` can post threads but **cannot resolve them**. This
+is a GitHub platform restriction. To enable auto-resolve, supply a **classic PAT
+with the `repo` scope** via `github-token` and set `bot-login` to that account's
+username. See [`SETUP.md`](SETUP.md).
 
 ## `Resource not accessible by personal access token` (HTTP 403)
 
-This is the fine-grained PAT equivalent of the same restriction. Even with
-Pull requests: write (and Issues: write for the summary comment), a
-fine-grained PAT **cannot** call `resolveReviewThread`. It *can* post threads
-and comments. Use a **classic PAT (`repo` scope)** for auto-resolve.
+The fine-grained PAT equivalent. Even with Pull requests: write, a fine-grained
+PAT **cannot** call `resolveReviewThread`; it can post threads and comments. Use
+a classic PAT for auto-resolve.
 
 If you are not trying to auto-resolve and still see this on every write:
 
-- The fine-grained token may not have **repository access** to the repo — under
-  *Repository access* pick the repo (or *All repositories*).
-- Permissions may be set to **Read-only** — set Contents: Read-only, Pull
-  requests: Read and write, and (for the summary comment) Issues: Read and
-  write.
+- The fine-grained token may lack **repository access** — grant the repo (or
+  *All repositories*).
+- Permissions may be **Read-only** — Contents: read, Pull requests: read/write,
+  Issues: read/write (for the summary comment), Statuses: read/write for
+  `--set-status`.
 
-## Threads are posted but merge is still green / not blocked
+## Threads are posted but merge is still green
 
 Merge gating depends on branch protection, not on the action. On the default
 branch enable **Require a pull request before merging** and **Require
-conversation resolution before merging** (Settings → Branches → Add rule).
-Branch protection can silently disappear if the repo visibility changes or the
-rule was never actually saved — re-check `Settings → Branches`.
+conversation resolution before merging** (Settings → Branches → Add rule). If
+the comparison is the `code-review-agent` commit status instead, remember it is
+only set with `--set-status` and needs `statuses: write`.
+
+On GitLab, enable **Settings → Merge requests → All threads must be resolved**
+or add `--fail-on critical` to the job; otherwise a green pipeline does not
+reflect open discussions.
 
 Note: GitHub's own **Copilot Code Review** also creates threads that block
 merge. If you don't use it, disable it in repo settings; it is separate from
 this agent.
 
-## `post-review: could not post any review thread — the token cannot write...`
+## `cra: no review thread could be posted — check the token's write permissions.`
 
-The token could not deliver any inline thread. Check that `github-token` has
-`pull-requests: write` (and repository access if it is a fine-grained token).
-The run intentionally fails so the misconfiguration is visible rather than
-silently posting nothing.
+The token could not deliver any inline thread, so the run exits `1` (even with
+`--fail-on none`) instead of silently posting nothing. Check
+`pull-requests: write` / GitLab Developer+ role with `api` scope, and repository
+access for fine-grained tokens.
 
-## Analysis produced invalid findings / `analysis_error=1`
+## Analysis failed (`analysis-failed=true`)
 
-The analyzer retries once, then degrades to an empty `findings.json` so the
-poster can still update the summary. Common causes:
+The analyzer retries once, then returns an error. **Nothing is posted and
+nothing is resolved**: existing threads keep blocking merge, the summary records
+the failure, and `--fail-on` (anything but `none`) exits `1`. Common causes:
 
-- **Wrong model or endpoint.** The default is OpenCode Go
-  (`go/deepseek-v4-flash` at `https://opencode.ai/zen/go/v1`). The model
-  `deepseek-v4-flash` does **not** exist on `api.deepseek.com`. Set `base-url`
-  and `model` to match your provider.
-- **Agent cannot read the scratch dir.** The read-only agent needs
-  `read: allow` and `external_directory: allow` in its generated opencode
-  config (set in `scripts/make-config.js`). If you forked/modified the action,
-  verify those are present.
-- **API key missing.** `api-key` is required; if the key env is empty the
-  analyzer writes a "skipped" findings file (see the log for
-  `Analysis skipped: API key not configured`).
-- **Provider outage / timeouts.** Check the `opencode.err` tail in the log.
+- **Wrong or retired model.** The log shows `provider error: 400 … Model is
+  unavailable`. Providers retire model ids (OpenCode Go dropped
+  `deepseek-v4-flash`; the default is now `go/deepseek-v4.1-flash`). List the
+  ids your key can use with `GET <base-url>/models` and set `model`/`CRA_MODEL`.
+  A non-retryable provider error skips the second attempt.
+- **Missing key.** `CRA_API_KEY` (or the legacy `DEEPSEEK_API_KEY`) is empty —
+  the log says `API key not configured`.
+- **Provider outage, rate limit or timeout.** Check the `opencode stderr (tail)`
+  block; raise `CRA_ANALYZE_TIMEOUT_MS` if the model is slow (default 900000).
+- **opencode missing.** `cannot start opencode: … ENOENT` — install
+  `opencode-ai@1.18.18` (the action and image do this) or set
+  `CRA_OPENCODE_BIN`.
+- **Agent cannot read the scratch dir.** The generated `opencode.json` allows
+  `external_directory` only for the scratch dir. If you forked the tool, verify
+  `buildOpencodeConfig` still emits that rule.
 
-Inspect the log for the model's stderr (`--- opencode stderr (tail) ---`) and
-the raw events (`--- opencode events (tail) ---`).
+## Model output was rejected (`analysis produced invalid findings`)
+
+The extractor tried the whole output, fenced blocks and balanced `{…}` spans,
+then retried with a stricter instruction. If both attempts failed, the model is
+not honouring the schema. Try a stronger model (`--model`), or inspect
+`events.jsonl` / `opencode.err` in the scratch dir (`.cra` on GitLab,
+`$RUNNER_TEMP/cra` on GitHub, `.review` for `analyze`).
 
 ## No threads at all, but the summary exists
 
-Info findings are never posted as threads — only Critical and Warning. If the
-reviewer genuinely found nothing critical/warning, only the summary appears.
-Also confirm the findings anchor to **added/modified lines**: GitHub rejects
-comments on unchanged lines, and the poster degrades those to summary-only.
+- **Info findings never become threads** — only Critical and Warning.
+- **Findings outside diff hunks go to the summary only.** The reviewer may
+  report an issue on an unchanged line; GitHub and GitLab cannot anchor a
+  comment there. Critical/Warning ones still count for `--fail-on`.
 
-## `post-review: found 0 bot thread(s) as <login>`
+## Threads are re-posted, or the agent does not recognise its own threads
 
-The poster could not find its own previous threads. Check `bot-login`:
+Check the bot identity:
 
 - With `GITHUB_TOKEN`, threads are authored by `github-actions` — keep the
-  default.
+  default `bot-login`.
 - With a classic PAT, threads are authored by **your username** — set
-  `bot-login` to it, otherwise the poster can't find (and dedupe against) its
-  own threads.
+  `bot-login`, otherwise the adapter cannot find (or dedupe against) its own
+  threads.
+- Only threads whose root comment carries the agent marker are considered.
+  Threads created by other tools or by humans are ignored by design.
 
 ## A fixed issue is not being resolved
 
-Resolution is deliberately conservative. The agent only resolves when the
-finding is gone **and** the code clearly changed (thread outdated, or its file
-in the current diff). If the code is untouched or the thread is not marked
-outdated, the agent leaves it open for a human. Resolved threads are never
-reopened.
+Resolution is deliberately conservative. A thread is auto-resolved only when
+the analysis succeeded, the issue was not re-reported, the thread is open, and
+either the platform marks it outdated or **its file changed since the last
+reviewed commit**. That commit comes from the reviewed-SHA marker in the summary
+comment; on a first run, a summary without the marker, or an unreachable SHA
+after a force-push, the fallback is all files changed in the PR. A re-run on the
+same head commit resolves nothing except outdated threads. Resolved threads are
+never reopened.
+
+## `cra: cannot fetch … (use a full clone / fetch-depth: 0)`
+
+The diff base is not in the clone. Set `fetch-depth: 0` (GitHub), `GIT_DEPTH:
+"0"` (GitLab), `clone: depth: full` (Bitbucket), `fetchDepth: 0` (Azure), or
+fetch the target branch explicitly as the Jenkins template does.
+
+## GitLab: `401 Unauthorized` / `403 Forbidden`
+
+- `GITLAB_TOKEN` missing or expired → exit `2` before analysis.
+- `CI_JOB_TOKEN` is rejected by design: it cannot create MR discussions. Use a
+  project/group access token with role Developer+ and the `api` scope.
+- Token scope `read_api` can read but not post.
+
+## GitLab: job runs on branch pipelines and exits 2
+
+The adapter requires a merge-request pipeline (`CI_MERGE_REQUEST_IID`). Keep the
+template's `rules: - if: $CI_PIPELINE_SOURCE == "merge_request_event"`.
+
+## Jenkins: container exits immediately
+
+Jenkins starts the container with its own command, so an image `ENTRYPOINT`
+breaks it (`cra cat` → exit 2). The template passes
+`args '--entrypoint= -e HOME=/tmp'`; keep it, and keep `HOME` writable for the
+uid Jenkins uses.
+
+## Azure: container job fails to start or cannot write reports
+
+Azure container jobs expect an image **without** `ENTRYPOINT` and run steps with
+`docker exec`. The template clears it with `options: '--entrypoint=""'` and runs
+as root (`-u 0`) so the SARIF/Markdown files land in the agent-owned workspace
+mount. If your policy forbids root containers, publish to a path the image user
+owns and chown the staging directory first.
+
+## Bitbucket: permission denied writing `cra-report.md`
+
+The Pipelines agent clones the workspace as its own user. The template sets
+`run-as-user: "0"`; if you must run non-root, point `run-as-user` at a uid that
+owns the workspace.
+
+## The diff is huge and some files were skipped
+
+The summary `Notes` section lists every file skipped by the diff budget
+(`--max-diff-bytes`, default 250000 bytes). Raise the budget, or exclude more
+paths with `--exclude`/`CRA_EXCLUDE`. Skipping is reported, never silent.
 
 ## Summary count says threads remain but I resolved them
 
-If a resolve API call fails (e.g. the token can't resolve), the poster counts
-the thread as still open in the summary's merge-gate note, rather than
-reporting a false "all clear". Fix the token (classic PAT) to auto-resolve, or
-resolve the remaining threads manually.
+If a resolve call fails (e.g. the token cannot resolve), the run counts the
+thread as still open rather than reporting a false "all clear". Fix the token,
+or resolve the remaining threads manually. A failed summary comment is logged
+but never fails the run; the threads are the gate.

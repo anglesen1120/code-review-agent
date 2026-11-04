@@ -6,10 +6,13 @@ import {
   normalizeTitle,
   sameLocationGuard,
   similarTitle,
-  isBotAuthor,
   markdownThread,
   markdownSummary,
-} from "../scripts/post-review.js";
+  parseThreadBody,
+  parseReviewedSha,
+  gateFails,
+  sanitize,
+} from "../src/lifecycle.js";
 
 const F = (o = {}) => ({
   severity: "Warning",
@@ -146,15 +149,6 @@ test("sameLocationGuard unit behavior", () => {
   assert.equal(sameLocationGuard(thread, F({ line: 10, title: "add cancellation token" })), false);
 });
 
-test("isBotAuthor accepts both github-actions spellings", () => {
-  assert.equal(isBotAuthor("github-actions", "github-actions"), true);
-  assert.equal(isBotAuthor("github-actions[bot]", "github-actions[bot]"), true);
-  assert.equal(isBotAuthor("github-actions", "github-actions[bot]"), true);
-  assert.equal(isBotAuthor("github-actions[bot]", "github-actions"), true);
-  assert.equal(isBotAuthor("copilot-pull-request-reviewer", "github-actions"), false);
-  assert.equal(isBotAuthor(null, "github-actions"), false);
-});
-
 test("similarTitle matches LLM re-wordings of the same issue", () => {
   assert.equal(
     similarTitle(
@@ -174,8 +168,28 @@ test("title-dedup suppresses a re-worded issue even when the line shifted", () =
   const threads = [
     T({ id: "old", path: "a.cs", line: 19, title: "Parameterize SQL query to prevent SQL injection in getUser" }),
   ];
-  const { toPost } = computeDelta(findings, threads, ["a.cs"]);
+  const { toPost, toResolve, kept } = computeDelta(findings, threads, ["a.cs"]);
   assert.equal(toPost.length, 0);
+  // Regression: the persisting issue's thread must stay open, not be
+  // auto-resolved because the file changed (it used to vanish from the gate).
+  assert.deepEqual(toResolve, []);
+  assert.deepEqual(kept.map((t) => t.id), ["old"]);
+});
+
+test("title-dedup ignores a same-kind issue far away in the same file", () => {
+  const findings = [F({ severity: "Critical", file: "a.cs", line: 200, title: "SQL injection via string concatenation in getOrder" })];
+  const threads = [T({ id: "r", path: "a.cs", line: 9, title: "SQL injection via string concatenation in getUser", isResolved: true })];
+  const { toPost } = computeDelta(findings, threads, ["a.cs"]);
+  assert.equal(toPost.length, 1);
+});
+
+test("title-dedup matches an outdated thread regardless of line distance", () => {
+  const findings = [F({ file: "a.cs", line: 300, title: "Missing null check on request payload" })];
+  const threads = [T({ id: "o", path: "a.cs", line: 5, title: "Missing null check on request payload", isOutdated: true })];
+  const { toPost, toResolve, kept } = computeDelta(findings, threads, ["a.cs"]);
+  assert.equal(toPost.length, 0);
+  assert.equal(toResolve.length, 0);
+  assert.equal(kept.length, 1);
 });
 
 test("title-dedup never re-nags an issue a dev already resolved", () => {
@@ -208,15 +222,54 @@ test("markdownSummary groups by severity, links lines, notes merge gate", () => 
       F({ severity: "Critical", category: "security", file: "src/a.cs", line: 42, title: "XSS", description: "Bad input." }),
       F({ severity: "Info", title: "Style nit" }),
     ],
-    headSha: "abc123",
+    headSha: "abc1234",
     prNumber: 7,
-    owner: "o",
-    repo: "r",
     unresolvedCount: 1,
+    fileUrl: (file, line) => `https://example.test/blob/abc1234/${file}#L${line}`,
+    notes: ["Diff over budget: big.js"],
+    prLabel: "MR",
   });
-  assert.match(md, /<!-- code-review-agent:summary -->/);
+  assert.ok(md.startsWith("<!-- code-review-agent:summary -->"));
+  assert.equal(parseReviewedSha(md), "abc1234");
   assert.match(md, /### Critical/);
-  assert.match(md, /https:\/\/github\.com\/o\/r\/blob\/abc123\/src\/a\.cs#L42/);
+  assert.match(md, /\(MR #7\)/);
+  assert.match(md, /https:\/\/example\.test\/blob\/abc1234\/src\/a\.cs#L42/);
   assert.match(md, /### Info/);
+  assert.match(md, /Diff over budget: big\.js/);
   assert.match(md, /1 unresolved review thread\(s\) remain/);
+});
+
+test("markdownSummary without fileUrl renders plain locations", () => {
+  const md = markdownSummary({ summary: "s", findings: [F({ file: "x.js", line: 3 })], headSha: "deadbeef", unresolvedCount: 0 });
+  assert.match(md, /`x\.js:3`/);
+  assert.doesNotMatch(md, /Merge gate/);
+});
+
+test("parseReviewedSha only trusts a body that starts with the summary marker", () => {
+  assert.equal(parseReviewedSha("hi <!-- code-review-agent:reviewed-sha=abcdef1 -->"), null);
+  assert.equal(parseReviewedSha(null), null);
+});
+
+test("parseThreadBody round-trips markdownThread severity and title", () => {
+  const body = markdownThread(F({ severity: "Critical", category: "security", title: "SQL injection" }));
+  assert.deepEqual(parseThreadBody(body), { severity: "Critical", title: "SQL injection" });
+  assert.deepEqual(parseThreadBody("plain human comment"), { severity: undefined, title: "plain human comment" });
+});
+
+test("sanitize breaks @mentions and HTML comments from model output", () => {
+  const s = sanitize("ping @octocat <!-- code-review-agent:summary --> mail a@b.com `@x`");
+  assert.doesNotMatch(s, /<!--/);
+  assert.match(s, /@\u200boctocat/);
+  assert.match(s, /a@b\.com/);
+  // A model title cannot spoof the thread marker.
+  assert.doesNotMatch(markdownThread(F({ title: "x <!-- code-review-agent -->" })).split("\n")[0], /<!--/);
+});
+
+test("gateFails thresholds", () => {
+  assert.equal(gateFails(["Warning"], "critical"), false);
+  assert.equal(gateFails(["Warning"], "warning"), true);
+  assert.equal(gateFails(["Critical"], "critical"), true);
+  assert.equal(gateFails(["Info"], "warning"), false);
+  assert.equal(gateFails(["Critical"], "none"), false);
+  assert.equal(gateFails([], "warning"), false);
 });

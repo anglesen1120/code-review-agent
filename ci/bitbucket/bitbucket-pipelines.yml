@@ -1,0 +1,26 @@
+# Bitbucket Pipelines: review every pull request.
+#
+# Repository variable (masked): CRA_API_KEY with the provider key.
+# Bitbucket Pipelines overrides the image ENTRYPOINT/CMD, so `cra` is invoked
+# from `script` like any other command.
+image:
+  name: ghcr.io/anglesen1120/code-review-agent:latest
+  # The Pipelines agent clones the repository as its own user before the step,
+  # so run as root to write reports into that workspace. Use 10001 to run as
+  # the image's non-root user when the workspace is owned by that uid.
+  run-as-user: "0"
+
+clone:
+  depth: full # the merge base between PR and destination branch must exist
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Code review
+          script:
+            - git fetch --no-tags origin "+refs/heads/${BITBUCKET_PR_DESTINATION_BRANCH}:refs/remotes/origin/${BITBUCKET_PR_DESTINATION_BRANCH}"
+            - cra review --platform none --fail-on critical --markdown cra-report.md --sarif cra.sarif
+          artifacts:
+            - cra-report.md
+            - cra.sarif

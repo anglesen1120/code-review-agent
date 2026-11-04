@@ -1,8 +1,10 @@
 # Thread lifecycle & the merge gate
 
 This document explains how the agent decides what to post, what to resolve,
-and why. The logic lives in `scripts/post-review.js` (`computeDelta` and the
-`apply` subcommand) and is fully covered by unit tests.
+and why. The logic lives in `src/lifecycle.js` (`computeDelta`, `matchThread`,
+`gateFails`) and is fully covered by unit tests; the platform adapters in
+`src/platforms/*` only perform the API calls, and `bin/cra.js` orchestrates
+them.
 
 ## The merge gate
 
@@ -10,6 +12,11 @@ The gate is GitHub's branch-protection rule **"Require conversation resolution
 before merging"**. The agent never merges anything and never touches branch
 protection; it simply creates (and resolves) review threads, and GitHub blocks
 merge while any thread on the PR is unresolved.
+
+On GitLab the equivalent switch is the project setting **Merge requests → All
+threads must be resolved**; inline findings are MR discussions there. On CIs
+without an adapter (Jenkins, Bitbucket, Azure) there are no threads, so the only
+gate is `--fail-on` and the job's exit code.
 
 ```
 PR opened   → agent posts threads            → merge BLOCKED
@@ -49,12 +56,25 @@ Only findings that pass all three checks get posted as a new thread.
 
 ## Resolving: when a thread is auto-resolved
 
-A thread is a candidate for resolution only when:
+A thread is auto-resolved only when all of these hold:
 
-- it is **open**, and
-- its key is **not** in the current desired set (the finding is gone), and
-- the code **clearly changed** — either the thread is outdated
-  (`isOutdated`) **or** its file is in the current diff's changed-files list.
+- the analysis **succeeded** — a failed analysis posts nothing and resolves
+  nothing, because it carries no evidence that anything was fixed;
+- the issue was **not re-reported** this run (no exact-key match, no fuzzy
+  title match);
+- it is **open** (a dev-resolved thread is never touched); and
+- the code **clearly changed**: the platform marks the thread outdated
+  (`isOutdated`; GitHub only — GitLab has no such flag) **or** its file changed
+  since the last reviewed commit.
+
+"Changed since the last reviewed commit" is computed from the reviewed-SHA
+marker (`<!-- code-review-agent:reviewed-sha=<sha> -->`) in the summary comment:
+the adapter returns that SHA, and the CLI asks git for the files changed between
+it and the head commit. When there is no previous reviewed SHA (first run, or a
+summary written before the marker existed) or the SHA is unreachable
+(force-push), the fallback is all files changed in the PR. Re-running on the
+same head commit therefore resolves nothing except threads the platform reports
+as outdated.
 
 If the code is untouched and the thread is not outdated, the thread is left
 open for a human. This is deliberately **conservative**: the agent would rather
@@ -105,4 +125,6 @@ merge-gate note, so a reviewer is never told "all clear" when threads remain.
 | No thread could be posted at all | Run fails with a clear token-permissions message (misconfiguration is visible). |
 | Resolve fails (token cannot resolve) | Logged; thread stays open; summary count is honest. |
 | Summary comment fails | Logged; threads are unaffected; run succeeds. |
-| Analysis produces invalid JSON | Retry once, then degrade to empty findings + error marker; summary still updates. |
+| Analysis produces invalid JSON | Retry once; then nothing is posted or resolved, the summary records the failure, and `--fail-on` (anything but `none`) exits 1. |
+| Nothing could be posted at all | Exit 1 even with `--fail-on none`, so a misconfigured token is visible. |
+| Finding outside a diff hunk | Summary only; Critical/Warning still count for `--fail-on`. |

@@ -3,9 +3,17 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Least privilege: read the code, write review threads and the summary comment.
+# Uncomment `statuses: write` when you enable `set-status` below.
 permissions:
   contents: read
   pull-requests: write
+  # statuses: write
+
+# One review per PR; a newer push cancels the stale run.
+concurrency:
+  group: code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   code-review:
@@ -15,11 +23,22 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
+          # Keep the workflow token out of .git/config while PR code is read.
+          persist-credentials: false
       - uses: anglesen1120/code-review-agent@v1
         with:
           api-key: ${{ secrets.DEEPSEEK_API_KEY }}
-          # A classic PAT (repo scope) is required for the agent to auto-resolve
-          # threads it previously flagged. Without it, GITHUB_TOKEN can post
-          # threads but cannot resolve them. Set bot-login to your username.
+          # Auto-resolve needs a classic PAT (repo scope); GITHUB_TOKEN can post
+          # threads but cannot resolve them. Set bot-login to that username.
           github-token: ${{ secrets.CODE_REVIEW_TOKEN }}
           bot-login: your-github-username
+          # Fail the job on open Critical findings. With any value other than
+          # `none`, a failed analysis also fails the job (fail closed).
+          fail-on: critical
+          # Optional: diff budget in bytes (default 250000); whole files beyond
+          # it are skipped and listed in the summary.
+          # max-diff-bytes: "250000"
+          # Optional: SARIF 2.1.0 report, e.g. for github/codeql-action/upload-sarif.
+          # sarif-file: code-review.sarif
+          # Optional: also set the `code-review-agent` commit status.
+          # set-status: true

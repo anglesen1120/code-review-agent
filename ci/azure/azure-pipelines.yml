@@ -1,0 +1,52 @@
+# Azure Pipelines PR validation.
+#
+# Azure Repos has no YAML `pr:` trigger for Git repositories: add a build
+# validation branch policy for the target branch that runs this pipeline. The
+# `pr:` block below only takes effect for GitHub/Bitbucket repositories.
+#
+# Pipeline variable (secret): CRA_API_KEY with the provider key.
+pr:
+  branches:
+    include:
+      - '*'
+
+jobs:
+  - job: code_review
+    pool:
+      vmImage: ubuntu-latest
+    container:
+      image: ghcr.io/anglesen1120/code-review-agent:latest
+      # Azure container jobs expect an image without ENTRYPOINT and run steps
+      # with `docker exec`. Clear our entrypoint and run as root so reports can
+      # be written into the agent-owned workspace mount.
+      options: '--entrypoint="" -u 0'
+    steps:
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: false
+
+      - bash: |
+          set -euo pipefail
+          target="${SYSTEM_PULLREQUEST_TARGETBRANCH#refs/heads/}"
+          git fetch --no-tags origin "+refs/heads/${target}:refs/remotes/origin/${target}"
+          mkdir -p "$BUILD_ARTIFACTSTAGINGDIRECTORY/CodeAnalysisLogs"
+          cra review --platform none --fail-on critical \
+            --sarif "$BUILD_ARTIFACTSTAGINGDIRECTORY/CodeAnalysisLogs/cra.sarif" \
+            --markdown "$BUILD_ARTIFACTSTAGINGDIRECTORY/cra-report.md"
+        displayName: Code review
+        env:
+          CRA_API_KEY: $(CRA_API_KEY)
+
+      - task: PublishPipelineArtifact@1
+        condition: always()
+        displayName: Publish SARIF (SAST scans tab)
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/CodeAnalysisLogs
+          artifact: CodeAnalysisLogs
+
+      - task: PublishPipelineArtifact@1
+        condition: always()
+        displayName: Publish markdown report
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/cra-report.md
+          artifact: code-review-report

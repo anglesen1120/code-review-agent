@@ -4,12 +4,14 @@ description: >-
   review threads + a summary comment. Unresolved threads block merge via GitHub
   branch protection. No external review SaaS.
 author: "anglesen1120"
+branding:
+  icon: "check-circle"
+  color: "blue"
 
 inputs:
   api-key:
     description: >-
-      Provider API key for the opencode analyzer (OpenAI-compatible endpoint),
-      e.g. the DEEPSEEK_API_KEY secret.
+      Provider API key for the opencode analyzer (OpenAI-compatible endpoint).
     required: true
   github-token:
     description: >-
@@ -25,17 +27,31 @@ inputs:
     required: false
     default: "https://opencode.ai/zen/go/v1"
   model:
-    description: "Provider/model for the analyzer, e.g. go/deepseek-v4-flash."
+    description: "Provider/model for the analyzer, e.g. go/deepseek-v4.1-flash."
     required: false
-    default: "go/deepseek-v4-flash"
+    default: "go/deepseek-v4.1-flash"
   diff-scope:
     description: "Extra comma-separated gitignore-style patterns to exclude from review."
     required: false
     default: ""
+  max-diff-bytes:
+    description: "Diff budget sent to the model; whole files beyond it are skipped and listed in the summary."
+    required: false
+    default: "250000"
+  fail-on:
+    description: >-
+      Fail the step when issues of this severity remain open: none | critical |
+      warning. With anything but none, a failed analysis also fails the step.
+    required: false
+    default: "none"
   set-status:
-    description: "Also set a commit status (failure while unresolved Critical/Warning threads remain)."
+    description: "Also set a commit status (needs statuses: write)."
     required: false
     default: "false"
+  sarif-file:
+    description: "Write a SARIF 2.1.0 report to this path (e.g. for github/codeql-action/upload-sarif)."
+    required: false
+    default: ""
   bot-login:
     description: >-
       Login of the token that posts/resolves review threads. For github.token
@@ -44,85 +60,51 @@ inputs:
       its own threads.
     required: false
     default: "github-actions"
+  opencode-version:
+    description: "opencode-ai npm version used by the analyzer."
+    required: false
+    default: "1.18.18"
 
 outputs:
   findings-count:
     description: "Total findings (all severities) for this run."
+    value: ${{ steps.review.outputs.findings-count }}
   unresolved-count:
     description: "Open Critical/Warning threads remaining after this run."
+    value: ${{ steps.review.outputs.unresolved-count }}
   review-id:
-    description: "GitHub review node id created this run, if any."
+    description: "GitHub review id created this run, if any."
+    value: ${{ steps.review.outputs.review-id }}
+  analysis-failed:
+    description: "true when the analyzer could not produce valid findings."
+    value: ${{ steps.review.outputs.analysis-failed }}
 
 runs:
   using: "composite"
   steps:
     - name: Install opencode CLI
       shell: bash
-      run: npm install -g opencode-ai@1.18.18
+      env:
+        OPENCODE_VERSION: ${{ inputs.opencode-version }}
+      run: npm install -g --no-audit --no-fund "opencode-ai@${OPENCODE_VERSION}"
 
-    - name: Prepare inputs and compute diff
-      id: prepare
+    # Every input travels through env, never ${{ }} inside the script body
+    # (no expression injection into bash).
+    - name: Review
+      id: review
       shell: bash
       env:
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        DIFF_SCOPE: ${{ inputs.diff-scope }}
-      run: |
-        set -euo pipefail
-        SCRATCH="${{ runner.temp }}/cra"
-        mkdir -p "$SCRATCH"
-        git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
-        {
-          echo "PR_NUMBER=$PR_NUMBER"
-          echo "BASE_SHA=$BASE_SHA"
-          echo "HEAD_SHA=$HEAD_SHA"
-          echo "MODEL=${{ inputs.model }}"
-          echo "BASE_URL=${{ inputs.base-url }}"
-        } > "$SCRATCH/env"
-        excludes=( ':(exclude)*.lock' ':(exclude)*.min.js' ':(exclude)*.min.css' ':(exclude)*.map'
-                   ':(exclude)yarn.lock' ':(exclude)pnpm-lock.yaml' ':(exclude)package-lock.json'
-                   ':(exclude)**/dist/**' ':(exclude)**/obj/**' ':(exclude)**/bin/**' ':(exclude)**/node_modules/**' )
-        IFS=',' read -r -a extra <<< "${DIFF_SCOPE:-}"
-        for p in "${extra[@]}"; do
-          p="${p// /}"
-          [ -n "$p" ] && excludes+=(":(exclude)$p")
-        done
-        git diff --no-color -U5 "$BASE_SHA...$HEAD_SHA" -- . "${excludes[@]}" > "$SCRATCH/pr.diff" || true
-        git diff --name-only "$BASE_SHA...$HEAD_SHA" -- . "${excludes[@]}" \
-          | SCRATCH="$SCRATCH" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{const fs=require("fs");fs.writeFileSync(process.env.SCRATCH+"/changed_files.json",JSON.stringify(d.split("\n").filter(Boolean)))})'
-        echo "diff_bytes=$(wc -c < "$SCRATCH/pr.diff" 2>/dev/null || echo 0)" >> "$GITHUB_OUTPUT"
-
-    - name: Fetch existing bot review threads
-      shell: bash
-      env:
+        CRA_API_KEY: ${{ inputs.api-key }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
-        GITHUB_REPOSITORY: ${{ github.repository }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
         BOT_LOGIN: ${{ inputs.bot-login }}
-        RUNNER_TEMP: ${{ runner.temp }}
-      run: node "${{ github.action_path }}/scripts/post-review.js" fetch
-
-    - name: Analyze with opencode (headless)
-      shell: bash
-      env:
-        ACTION_PATH: ${{ github.action_path }}
-        MODE: ci
-        DEEPSEEK_API_KEY: ${{ inputs.api-key }}
-        GITHUB_WORKSPACE: ${{ github.workspace }}
-        RUNNER_TEMP: ${{ runner.temp }}
-      run: bash "${{ github.action_path }}/scripts/analyze.sh"
-
-    - name: Post threads, resolve fixed, update summary
-      id: apply
-      shell: bash
-      env:
-        GITHUB_TOKEN: ${{ inputs.github-token }}
-        GITHUB_REPOSITORY: ${{ github.repository }}
-        PR_NUMBER: ${{ github.event.pull_request.number }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        SET_STATUS: ${{ inputs.set-status }}
-        RUNNER_TEMP: ${{ runner.temp }}
+        CRA_BASE_URL: ${{ inputs.base-url }}
+        CRA_MODEL: ${{ inputs.model }}
+        CRA_EXCLUDE: ${{ inputs.diff-scope }}
+        CRA_MAX_DIFF_BYTES: ${{ inputs.max-diff-bytes }}
+        CRA_FAIL_ON: ${{ inputs.fail-on }}
+        CRA_SET_STATUS: ${{ inputs.set-status }}
+        SARIF_FILE: ${{ inputs.sarif-file }}
       run: |
-        node "${{ github.action_path }}/scripts/post-review.js" apply
+        args=(review --platform github)
+        if [ -n "$SARIF_FILE" ]; then args+=(--sarif "$SARIF_FILE"); fi
+        node "$GITHUB_ACTION_PATH/bin/cra.js" "${args[@]}"
