@@ -114,13 +114,25 @@ function hasCommit(ref, cwd) {
   }
 }
 
+// Plain ref names only: `git fetch` parses options after the remote too, so a
+// ref that reaches argv could be read as `--upload-pack=<helper>` (arbitrary
+// execution) or as an `a:b` refspec (writes a local ref).
+const FETCH_REF_RE = /^[A-Za-z0-9._/-]+$/;
+
 /** Shallow CI clones (GitLab GIT_DEPTH, checkout fetch-depth 1) may lack the base. */
-function ensureCommits(refs, cwd, log) {
+export function ensureCommits(refs, cwd, log) {
   const missing = refs.filter((r) => r && !hasCommit(r, cwd));
   if (missing.length === 0) return;
+  const targets = missing.map((r) => r.replace(/^origin\//, ""));
+  targets.forEach((target, i) => {
+    if (target.startsWith("-") || !FETCH_REF_RE.test(target)) {
+      throw new Error(`cannot fetch '${missing[i]}': not a plain ref name`);
+    }
+  });
   log(`code-review-agent: fetching ${missing.join(", ")}`);
   try {
-    git(["fetch", "--no-tags", "origin", ...missing.map((r) => r.replace(/^origin\//, ""))], cwd);
+    // `--` ends option parsing: nothing after it can be a git flag.
+    git(["fetch", "--no-tags", "--", "origin", ...targets], cwd);
   } catch (e) {
     throw new Error(`cannot fetch ${missing.join(", ")} (use a full clone / fetch-depth: 0): ${e.stderr || e.message}`);
   }
@@ -132,7 +144,8 @@ function defaultOutDir(env, cwd, command) {
   if (env.GITLAB_CI === "true") return join(cwd, ".cra"); // artifacts must live in the project dir
   // Unpredictable 0700 scratch dir: a shared /tmp/cra-<pid> could be pre-created
   // by another local user. The analysis snapshot never lives here (see run()).
-  return mkdtempSync(join(tmpdir(), "cra-"));
+  // realpath: opencode compares canonical paths; /tmp is a symlink on macOS.
+  return realpathSync(mkdtempSync(join(tmpdir(), "cra-")));
 }
 
 const writeOut = (path, content) => writeFileSync(path, typeof content === "string" ? content : JSON.stringify(content, null, 2));
@@ -315,7 +328,7 @@ export async function run(argv, { env = process.env, cwd = process.cwd(), log = 
       let analysisRoot = workspace;
       if (!workingTree) {
         try {
-          snapshotDir = mkdtempSync(join(tmpdir(), "cra-snap-"));
+          snapshotDir = realpathSync(mkdtempSync(join(tmpdir(), "cra-snap-")));
           const snapshot = snapshotTree({ rev: headSha, cwd: workspace, dest: snapshotDir });
           analysisRoot = snapshot.dir;
           if (snapshot.symlinksRemoved > 0) {

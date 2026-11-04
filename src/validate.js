@@ -90,7 +90,11 @@ export function normalizeFindings(data, { workspace, max = MAX_FINDINGS } = {}) 
         );
         continue;
       }
-      kept.push({ ...withCappedFields(f), file });
+      // Models sometimes give only a range for multi-line issues; anchor at its start
+      // instead of rejecting the whole result (which costs a retry or fails closed).
+      const line = Number.isInteger(f.line) && f.line > 0 ? f.line
+        : Number.isInteger(f.startLine) && f.startLine > 0 ? f.startLine : f.line;
+      kept.push({ ...withCappedFields(f), file, line });
     } else {
       kept.push(f);
     }

@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { run, safeConsole } from "../bin/cra.js";
+import { ensureCommits, run, safeConsole } from "../bin/cra.js";
 import { markdownThread, parseThreadBody, threadKey } from "../src/lifecycle.js";
 
 const git = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -433,4 +433,74 @@ test("an unexpected throw exits 2 with sanitized stderr", () => {
   assert.equal(res.status, 2);
   assert.doesNotMatch(res.stderr, /^[^\S\r\n]*::/m);
   assert.match(res.stderr, /\u200b::add-mask::secret/);
+});
+
+/** Local "origin" (branch feature at c2, main at c3) and a shallow clone of it. */
+function makeOrigin() {
+  const origin = mkdtempSync(join(tmpdir(), "cra-origin-"));
+  git(origin, "init", "-q", "-b", "main");
+  git(origin, "config", "user.email", "t@t");
+  git(origin, "config", "user.name", "t");
+  writeFileSync(join(origin, "a.js"), "a\n");
+  git(origin, "add", ".");
+  git(origin, "commit", "-qm", "c1");
+  git(origin, "checkout", "-qb", "feature");
+  writeFileSync(join(origin, "f.js"), "f\n");
+  git(origin, "add", ".");
+  git(origin, "commit", "-qm", "c2");
+  const featureSha = git(origin, "rev-parse", "HEAD");
+  git(origin, "checkout", "-q", "main");
+  writeFileSync(join(origin, "b.js"), "b\n");
+  git(origin, "add", ".");
+  git(origin, "commit", "-qm", "c3");
+  return { origin, featureSha };
+}
+
+function shallowClone(origin) {
+  const work = join(mkdtempSync(join(tmpdir(), "cra-work-")), "repo");
+  git(tmpdir(), "clone", "-q", "--depth", "1", `file://${origin}`, work);
+  return work;
+}
+
+test("a ref can never reach git fetch as an option", (t) => {
+  const { origin } = makeOrigin();
+  const work = shallowClone(origin);
+  const canaryDir = mkdtempSync(join(tmpdir(), "cra-canary-"));
+  t.after(() => {
+    for (const p of [origin, work, canaryDir]) rmSync(p, { recursive: true, force: true });
+  });
+  const marker = join(canaryDir, "pwned");
+  const canary = join(canaryDir, "canary.sh");
+  writeFileSync(canary, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+  chmodSync(canary, 0o755);
+
+  const logs = [];
+  assert.throws(
+    () => ensureCommits([`origin/--upload-pack=${canary}`], work, (m) => logs.push(m)),
+    /not a plain ref name/,
+  );
+  assert.equal(existsSync(marker), false, "upload-pack helper never ran");
+  assert.doesNotMatch(logs.join("\n"), /fetching/, "git was never called");
+
+  // The same ref through the CLI exits 2 without running the helper.
+  const cliLogs = [];
+  const code = await2(run(["review", "--platform", "none", "--base", `origin/--upload-pack=${canary}`, "--out-dir",
+    mkdtempSync(join(tmpdir(), "cra-out-"))], {
+    env: { PATH: process.env.PATH }, cwd: work, log: (m) => cliLogs.push(m), out: () => {},
+  }));
+  assert.equal(code, 2);
+  assert.equal(existsSync(marker), false);
+  assert.match(cliLogs.join("\n"), /not a plain ref name/);
+});
+
+test("ensureCommits still fetches a legitimate missing ref through --", (t) => {
+  const { origin, featureSha } = makeOrigin();
+  const work = shallowClone(origin);
+  t.after(() => {
+    for (const p of [origin, work]) rmSync(p, { recursive: true, force: true });
+  });
+  const logs = [];
+  ensureCommits(["origin/feature"], work, (m) => logs.push(m));
+  assert.match(logs.join("\n"), /fetching origin\/feature/);
+  assert.equal(git(work, "rev-parse", "FETCH_HEAD"), featureSha, "the fetch really ran");
 });

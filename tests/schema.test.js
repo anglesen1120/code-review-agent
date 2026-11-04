@@ -134,3 +134,12 @@ test("normalizeFindings leaves fields at or under the caps untouched", () => {
   assert.equal(data.findings[0].title, finding.title);
   assert.equal(data.findings[0].description, finding.description);
 });
+
+test("normalizeFindings anchors a range-only finding at startLine; no line at all still fails validation", () => {
+  const { line, ...rest } = sample.findings[0];
+  const ranged = normalizeFindings({ summary: "s", findings: [{ ...rest, startLine: 7, endLine: 9 }] }).data;
+  assert.equal(ranged.findings[0].line, 7);
+  assert.equal(validateFindings(ranged).ok, true);
+  const bare = normalizeFindings({ summary: "s", findings: [rest] }).data;
+  assert.equal(validateFindings(bare).ok, false);
+});
