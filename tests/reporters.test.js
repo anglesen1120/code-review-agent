@@ -135,3 +135,27 @@ test("toMarkdownReport handles no findings and neutralizes mentions", () => {
   assert.doesNotMatch(risky, /@maintainer/);
   assert.doesNotMatch(risky, /<!-- marker -->/);
 });
+
+const quickActionLines = (text) => String(text).split("\n").filter((line) => /^[ \t]*\//.test(line));
+
+test("toMarkdownReport neutralizes GitLab quick actions in every model field", () => {
+  const md = toMarkdownReport({
+    summary: "Overview\n/approve\n/merge",
+    findings: [
+      {
+        severity: "Critical",
+        category: "security",
+        file: "src/auth.js",
+        line: 42,
+        title: "Gate\n/merge bypass",
+        description: "The guard is gone.\n/approve",
+        suggestion: "Restore it.\n  /close",
+      },
+    ],
+    notes: ["Diff capped\n/approve"],
+  });
+  assert.deepEqual(quickActionLines(md), []);
+  assert.match(md, /\u200b\/approve/);
+  assert.match(md, /\u200b\/merge/);
+  assert.match(md, /\u200b\/close/);
+});

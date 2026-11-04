@@ -46,7 +46,7 @@ function mockFetch(routes) {
   const fetchImpl = async (url, init = {}) => {
     const method = init.method ?? "GET";
     const body = init.body === undefined ? undefined : JSON.parse(init.body);
-    calls.push({ url, method, body, headers: init.headers ?? {} });
+    calls.push({ url, method, body, headers: init.headers ?? {}, redirect: init.redirect });
     for (const [index, route] of routes.entries()) {
       if (route.method !== method || !route.test(url)) continue;
       const n = counts.get(index) ?? 0;
@@ -441,4 +441,145 @@ test("does not retry a 4xx and includes method, path, status and message", async
     return true;
   });
   assert.equal(calls.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Reviewed head vs MR diff_refs, redirects, fileUrl
+// ---------------------------------------------------------------------------
+
+const reviewedSha = "d".repeat(40);
+const versionBase = "e".repeat(40);
+const versionStart = "f".repeat(40);
+
+const versionsUrl = `${mrPath}/versions?per_page=100&page=1`;
+
+test("postThreads uses the MR version whose head is the reviewed head", async () => {
+  const added = finding("src/added.js", 10, "Added line bug");
+  const { fetchImpl, calls } = mockFetch(
+    routesFor([
+      {
+        method: "GET",
+        test: (url) => url === versionsUrl,
+        respond: () => json(
+          200,
+          [
+            { id: 1, head_commit_sha: headSha, base_commit_sha: baseSha, start_commit_sha: startSha },
+            { id: 2, head_commit_sha: reviewedSha, base_commit_sha: versionBase, start_commit_sha: versionStart },
+          ],
+          { "x-next-page": "" },
+        ),
+      },
+      { method: "POST", test: (url) => url === `${mrPath}/discussions`, respond: () => json(201, { id: "new" }) },
+    ]),
+  );
+  const platform = createGitLabPlatform({ env: baseEnv(), fetchImpl });
+  // The CLI rewrites the reviewed SHA after the adapter is created.
+  platform.context.headSha = reviewedSha;
+
+  const result = await platform.postThreads([{ finding: added, anchor: { type: "add", oldLine: null } }]);
+
+  assert.deepEqual(result.posted, [added]);
+  assert.deepEqual(result.failed, []);
+  const post = calls.find((call) => call.method === "POST");
+  assert.equal(post.body.position.head_sha, reviewedSha);
+  assert.equal(post.body.position.base_sha, versionBase);
+  assert.equal(post.body.position.start_sha, versionStart);
+
+  const order = calls.map((call) => call.url);
+  assert.ok(order.indexOf(versionsUrl) < order.indexOf(`${mrPath}/discussions`), "versions resolve before posting");
+});
+
+test("postThreads fails every item when no MR version matches the reviewed head", async () => {
+  const first = finding("src/a.js", 4, "First");
+  const second = finding("src/b.js", 9, "Second");
+  const { fetchImpl, calls } = mockFetch(
+    routesFor([
+      {
+        method: "GET",
+        test: (url) => url === versionsUrl,
+        respond: () => json(
+          200,
+          [{ id: 1, head_commit_sha: headSha, base_commit_sha: baseSha, start_commit_sha: startSha }],
+          { "x-next-page": "" },
+        ),
+      },
+    ]),
+  );
+  const platform = createGitLabPlatform({ env: baseEnv(), fetchImpl });
+  platform.context.headSha = reviewedSha;
+
+  const result = await platform.postThreads([
+    { finding: first, anchor: { type: "add", oldLine: null } },
+    { finding: second, anchor: { type: "add", oldLine: null } },
+  ]);
+
+  assert.deepEqual(result.posted, []);
+  assert.equal(result.failed.length, 2);
+  assert.deepEqual(result.failed.map((entry) => entry.finding), [first, second]);
+  for (const entry of result.failed) {
+    assert.match(entry.error, /no MR version has head_commit_sha/);
+    assert.ok(entry.error.includes(reviewedSha));
+    assert.ok(!entry.error.includes(token));
+  }
+  assert.equal(calls.filter((call) => call.method === "POST").length, 0, "nothing may be posted under the wrong refs");
+});
+
+test("postThreads resolves the version refs once for repeated posts", async () => {
+  const first = finding("src/a.js", 4, "First");
+  const second = finding("src/b.js", 9, "Second");
+  const { fetchImpl, calls } = mockFetch(
+    routesFor([
+      {
+        method: "GET",
+        test: (url) => url === versionsUrl,
+        respond: () => json(
+          200,
+          [{ id: 2, head_commit_sha: reviewedSha, base_commit_sha: versionBase, start_commit_sha: versionStart }],
+          { "x-next-page": "" },
+        ),
+      },
+      { method: "POST", test: (url) => url === `${mrPath}/discussions`, respond: () => json(201, { id: "new" }) },
+    ]),
+  );
+  const platform = createGitLabPlatform({ env: baseEnv(), fetchImpl });
+  platform.context.headSha = reviewedSha;
+
+  await platform.postThreads([{ finding: first, anchor: null }]);
+  await platform.postThreads([{ finding: second, anchor: null }]);
+
+  assert.equal(calls.filter((call) => call.url === versionsUrl).length, 1);
+  assert.equal(calls.filter((call) => call.method === "POST").length, 2);
+});
+
+test("a 3xx response is an error and the request never follows it", async () => {
+  const statusUrl = `${apiUrl}/projects/${projectId}/statuses/${headSha}`;
+  const { fetchImpl, calls } = mockFetch([
+    {
+      method: "POST",
+      test: (url) => url === statusUrl,
+      respond: () => json(302, null, { location: "https://evil.example/steal" }),
+    },
+  ]);
+  const platform = createGitLabPlatform({ env: baseEnv(), fetchImpl, log: () => {} });
+
+  await assert.rejects(platform.setStatus("success", "ok"), /302 unexpected redirect to https:\/\/evil\.example\/steal/);
+
+  assert.equal(calls.length, 1, "a redirect is not retried");
+  assert.equal(calls[0].redirect, "manual", "redirects must never be followed with the token attached");
+  assert.equal(calls[0].headers["PRIVATE-TOKEN"], token);
+});
+
+test("fileUrl encodes reserved characters in every path segment", () => {
+  const platform = createGitLabPlatform({ env: baseEnv(), fetchImpl: async () => json(200, {}) });
+  const blob = `${projectUrl}/-/blob/${headSha}`;
+  assert.equal(platform.fileUrl("src/a b#c?d.js", 3), `${blob}/src/a%20b%23c%3Fd.js#L3`);
+  assert.equal(platform.fileUrl("src/a (b).js"), `${blob}/src/a%20%28b%29.js`);
+  assert.equal(platform.fileUrl("./src/deep/x.js"), `${blob}/src/deep/x.js`);
+  assert.equal(platform.fileUrl("src/100%done.js"), `${blob}/src/100%25done.js`);
+
+  const trailing = createGitLabPlatform({
+    env: baseEnv({ CI_PROJECT_URL: `${projectUrl}/` }),
+    fetchImpl: async () => json(200, {}),
+  });
+  assert.equal(trailing.fileUrl("src/x.js", 1), `${blob}/src/x.js#L1`);
 });

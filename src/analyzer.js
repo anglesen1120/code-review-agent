@@ -32,8 +32,19 @@ export function buildOpencodeConfig({ baseUrl = DEFAULT_BASE_URL, model = DEFAUL
   const scratch = scratchDir.replace(/\/+$/, "");
   return {
     $schema: "https://opencode.ai/config.json",
+    // CI runs must not mutate the machine or phone home (verified accepted by
+    // opencode 1.18.18: `debug config` keeps these values).
+    autoupdate: false,
+    share: "disabled",
+    snapshot: false,
+    // No language servers: they spawn processes we do not control in the
+    // snapshot and can be tricked into reading outside it.
+    lsp: false,
     provider: {
       [providerName]: {
+        // Must stay the exact package string: opencode 1.18.18 compares it for
+        // equality when picking its native request adapter, so a pinned
+        // "pkg@version" spec silently throws "unsupported provider package".
         npm: "@ai-sdk/openai-compatible",
         name: providerName,
         options: { baseURL: baseUrl, apiKey: `{env:${KEY_ENV}}` },
@@ -65,7 +76,7 @@ export function buildOpencodeConfig({ baseUrl = DEFAULT_BASE_URL, model = DEFAUL
           },
           glob: "allow",
           grep: "allow",
-          lsp: "allow",
+          lsp: "deny",
           todowrite: "allow",
           edit: "deny",
           bash: "deny",
@@ -163,7 +174,10 @@ export function extractFindings(eventsText, { workspace } = {}) {
 }
 
 // Environment passed to opencode: an allow-list, never the CI tokens.
-const ENV_ALLOW = /^(PATH|HOME|TMPDIR|TEMP|TMP|LANG|LC_\w+|TZ|XDG_\w+|SSL_CERT_\w+|NODE_EXTRA_CA_CERTS|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy|OPENCODE_\w+|SYSTEMROOT|APPDATA|LOCALAPPDATA|USERPROFILE)$/;
+// No parent OPENCODE_* is forwarded: OPENCODE_CONFIG_CONTENT and
+// OPENCODE_PERMISSION (verified on opencode 1.18.18) replace/extend our
+// hardened config, so the caller's values must not reach the child.
+const ENV_ALLOW = /^(PATH|HOME|TMPDIR|TEMP|TMP|LANG|LC_\w+|TZ|XDG_\w+|SSL_CERT_\w+|NODE_EXTRA_CA_CERTS|HTTPS?_PROXY|NO_PROXY|https?_proxy|no_proxy|SYSTEMROOT|APPDATA|LOCALAPPDATA|USERPROFILE)$/;
 
 export function childEnv(env, apiKey, configPath) {
   const out = {};
@@ -172,6 +186,10 @@ export function childEnv(env, apiKey, configPath) {
   out.OPENCODE_CONFIG = configPath;
   // Ignore consumer-repo opencode.json + AGENTS.md: they must not steer us.
   out.OPENCODE_DISABLE_PROJECT_CONFIG = "1";
+  // No self-update, no LSP binaries downloaded, no default plugins executing.
+  out.OPENCODE_DISABLE_AUTOUPDATE = "1";
+  out.OPENCODE_DISABLE_LSP_DOWNLOAD = "1";
+  out.OPENCODE_DISABLE_DEFAULT_PLUGINS = "1";
   return out;
 }
 
@@ -204,12 +222,67 @@ function runOnce({ bin, args, cwd, env, eventsPath, errPath, timeoutMs }) {
   });
 }
 
-function tail(path, n) {
+function tail(path, n, scrub) {
   try {
-    return readFileSync(path, "utf8").trimEnd().split("\n").slice(-n).join("\n");
+    // Redact the whole file before slicing: a secret must not survive because
+    // it sits on a cut line or spans one (multi-line values).
+    const text = scrub(readFileSync(path, "utf8"));
+    return text.trimEnd().split("\n").slice(-n).join("\n");
   } catch {
     return "";
   }
+}
+
+// Credentials that must never reach a log line or a returned error: the API
+// key plus any env value whose name looks like a secret. opencode/provider
+// errors quote keys, and debug output can echo the environment.
+const SECRET_ENV = /(TOKEN|KEY|SECRET|PASSWORD)/i;
+const PROXY_ENV = /^(HTTPS?_PROXY|https?_proxy)$/;
+const REDACTED = "[REDACTED]";
+// Placeholder used while scanning: it never contains a secret, so a later
+// (shorter) secret cannot match inside an already-redacted span.
+const MARK = "\u0000";
+
+/** user:password from a proxy URL, which CI logs like to echo. */
+function proxyCredentials(value) {
+  if (typeof value !== "string" || value === "") return [];
+  try {
+    const u = new URL(value.includes("://") ? value : `http://${value}`);
+    return [u.password ? `${u.username}:${u.password}` : "", u.password];
+  } catch {
+    return [];
+  }
+}
+
+export function secretValues(env, apiKey) {
+  const out = new Set();
+  const add = (v) => {
+    if (typeof v !== "string" || v.trim() === "") return;
+    // Loggers trim values and print them line by line, so cover those forms
+    // too; event lines are JSON, so cover the escaped form as well.
+    const forms = [v, v.trim()];
+    for (const line of v.split(/\r?\n/)) forms.push(line, line.trim());
+    for (const form of forms) {
+      if (form.trim() === "") continue;
+      out.add(form);
+      const json = JSON.stringify(form);
+      if (json.length > 2) out.add(json.slice(1, -1));
+    }
+  };
+  add(apiKey);
+  for (const [k, v] of Object.entries(env ?? {})) {
+    if (SECRET_ENV.test(k)) add(v);
+    else if (PROXY_ENV.test(k)) for (const part of proxyCredentials(v)) add(part);
+  }
+  // Longest first: a secret containing another must be replaced as a whole.
+  return [...out].sort((a, b) => b.length - a.length);
+}
+
+export function scrubSecrets(text, secrets) {
+  let s = String(text);
+  if (secrets.length === 0) return s;
+  for (const secret of secrets) s = s.split(secret).join(MARK);
+  return s.split(MARK).join(REDACTED);
 }
 
 /**
@@ -244,8 +317,11 @@ export async function runAnalysis({
     "Output ONLY the JSON findings object described in your system prompt.";
   const strict = " Output ONLY the JSON object. No markdown fences, no prose, no commentary.";
   const cenv = childEnv(env, apiKey, configPath);
+  const secrets = secretValues(env, apiKey);
+  const scrub = (text) => scrubSecrets(text, secrets);
 
   let lastError = null;
+  let processFailed = false;
   for (const [i, extra] of [[0, ""], [1, strict]]) {
     const eventsPath = join(scratchDir, i === 0 ? "events.jsonl" : "events.retry.jsonl");
     const errPath = join(scratchDir, "opencode.err");
@@ -253,18 +329,26 @@ export async function runAnalysis({
     const args = ["run", "--agent", "code-reviewer", "--format", "json", "--model", `${providerName}/${modelName}`, task + extra];
     const r = await runOnce({ bin: opencodeBin, args, cwd: workspace, env: cenv, eventsPath, errPath, timeoutMs });
     if (r.error && r.code === -1) {
-      return { data: null, error: `cannot start ${opencodeBin}: ${r.error}`, dropped: [] };
+      return { data: null, error: scrub(`cannot start ${opencodeBin}: ${r.error}`), dropped: [] };
     }
+    // Fail closed: a crashed or signalled child may have printed a partial
+    // object before dying, so its output is not trustworthy.
+    const exitError = r.error ?? (r.code === 0 ? null : `opencode exited with code ${r.code}`);
     const { data, errors, dropped, apiError } = extractFindings(readFileSync(eventsPath, "utf8"), { workspace });
-    if (data) return { data, error: null, dropped };
-    lastError = r.error ?? (apiError ? `provider error: ${apiError.message}` : errors.join("; "));
+    if (data && !exitError) return { data, error: null, dropped };
+    processFailed ||= Boolean(exitError);
+    lastError = scrub(apiError ? `provider error: ${apiError.message}` : (exitError ?? errors.join("; ")));
     log(`code-review-agent: attempt ${i + 1} produced no valid findings: ${lastError}`);
     const giveUp = i === 1 || (apiError && !apiError.retryable);
     if (giveUp) {
-      log("--- opencode stderr (tail) ---\n" + tail(errPath, 25));
-      log("--- opencode events (tail) ---\n" + tail(eventsPath, 8));
+      log("--- opencode stderr (tail) ---\n" + tail(errPath, 25, scrub));
+      log("--- opencode events (tail) ---\n" + tail(eventsPath, 8, scrub));
       break;
     }
   }
-  return { data: null, error: `analysis produced invalid findings: ${lastError}`, dropped: [] };
+  return {
+    data: null,
+    error: `${processFailed ? "analysis failed" : "analysis produced invalid findings"}: ${lastError}`,
+    dropped: [],
+  };
 }

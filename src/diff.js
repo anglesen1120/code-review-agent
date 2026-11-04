@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 
 // Keep the original action's exclusions for every CI entry point.
 export const DEFAULT_EXCLUDES = Object.freeze([
@@ -189,8 +190,9 @@ function git(args, cwd) {
 }
 
 // execFileSync prevents shell injection but not OPTION injection: a revision
-// starting with "-" would be parsed as a git flag (`--output=<file>`).
-function assertRevision(name, value) {
+// starting with "-" would be parsed as a git flag (`--output=<file>`). Exported
+// so the CLI rejects bad revisions before any git command runs (fetch included).
+export function assertRevision(name, value) {
   if (typeof value !== "string" || !value) throw new TypeError(`${name} revision is required`);
   if (value.startsWith("-") || /[\s\0]/.test(value)) {
     throw new TypeError(`${name} is not a valid git revision: ${value}`);
@@ -209,16 +211,30 @@ const pathspec = (pattern) => (
     : [`:(exclude)${pattern}`]
 );
 
+const excludedPaths = (excludes) => {
+  const extra = typeof excludes === "string" ? excludes.split(",") : excludes;
+  return [...DEFAULT_EXCLUDES, ...extra.map((p) => p.trim()).filter(Boolean)].flatMap(pathspec);
+};
+
 export function gitDiff({ base, head, excludes = [], cwd } = {}) {
   assertRevision("base", base);
   assertRevision("head", head);
-  const extra = typeof excludes === "string" ? excludes.split(",") : excludes;
-  const patterns = [...DEFAULT_EXCLUDES, ...extra.map((p) => p.trim()).filter(Boolean)];
-  const pathspecs = patterns.flatMap(pathspec);
-  const scope = [`${base}...${head}`, "--", ".", ...pathspecs];
+  const scope = [`${base}...${head}`, "--", ".", ...excludedPaths(excludes)];
   const diff = git([...PREFIX_OPTS, "diff", "--no-color", "-U5", ...scope], cwd);
   const changedFiles = git([...PREFIX_OPTS, "diff", "--name-only", "-z", ...scope], cwd).split("\0").filter(Boolean);
   return { diff, changedFiles };
+}
+
+/**
+ * Same exclusions as gitDiff for `cra analyze` without --base: tracked local
+ * changes against HEAD (untracked files are not reviewed).
+ */
+export function workingTreeDiff({ cwd, excludes = [] } = {}) {
+  const scope = ["HEAD", "--", ".", ...excludedPaths(excludes)];
+  return {
+    diff: git([...PREFIX_OPTS, "diff", "--no-color", "-U5", ...scope], cwd),
+    changedFiles: git([...PREFIX_OPTS, "diff", "--name-only", "-z", ...scope], cwd).split("\0").filter(Boolean),
+  };
 }
 
 export function changedFilesBetween({ from, to, cwd } = {}) {
@@ -236,20 +252,44 @@ export function changedFilesBetween({ from, to, cwd } = {}) {
 }
 
 /**
- * Export the tracked tree at `rev` into `dest` (no .git, no untracked files).
- * The analyzer runs inside this snapshot so a prompt-injected model cannot
- * read the checkout's .git/config (CI token) or untracked secrets.
+ * Export the tracked tree at `rev` into `dest` (no .git history, no untracked
+ * files) and remove every symlink so the model cannot read outside the
+ * snapshot. `dest` must be an empty/absent directory, and `git init` gives the
+ * snapshot its own empty repository: the analyzer's workspace resolves to the
+ * snapshot, never to the checkout's .git (which holds the remote URL + token).
+ * @returns {{dir: string, symlinksRemoved: number}}
  */
 export function snapshotTree({ rev, cwd, dest } = {}) {
   assertRevision("rev", rev);
+  if (typeof dest !== "string" || !dest) throw new TypeError("snapshot destination is required");
+  if (existsSync(dest)) {
+    if (!statSync(dest).isDirectory()) throw new Error(`snapshot destination is not a directory: ${dest}`);
+    if (readdirSync(dest).length > 0) throw new Error(`snapshot destination is not empty: ${dest}`);
+  } else {
+    mkdirSync(dest, { recursive: true, mode: 0o700 });
+  }
   const tarPath = `${dest}.tar`;
-  rmSync(dest, { recursive: true, force: true });
-  mkdirSync(dest, { recursive: true });
   try {
     git(["archive", "--format=tar", "-o", tarPath, rev], cwd);
     execFileSync("tar", ["-xf", tarPath, "-C", dest], { stdio: ["ignore", "ignore", "pipe"] });
   } finally {
     rmSync(tarPath, { force: true });
   }
-  return dest;
+  const symlinksRemoved = removeSymlinks(dest);
+  execFileSync("git", ["init", "-q"], { cwd: dest, stdio: ["ignore", "ignore", "pipe"] });
+  return { dir: dest, symlinksRemoved };
+}
+
+function removeSymlinks(dir) {
+  let removed = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isSymbolicLink()) {
+      unlinkSync(path);
+      removed++;
+    } else if (entry.isDirectory()) {
+      removed += removeSymlinks(path);
+    }
+  }
+  return removed;
 }

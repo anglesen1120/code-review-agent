@@ -48,7 +48,13 @@ findings object to a chosen path.
 
 If the analysis fails, the CLI prints the reason, and `.review/findings.json`
 contains an empty findings list with the failure summary. Treat that as "review
-unavailable", not as "no issues".
+unavailable", not as "no issues". The same applies when the diff exceeds
+`--max-diff-bytes`: skipped files are listed in the notes and are not reviewed,
+and a fully over-budget diff exits `1` without findings.
+
+Without `--base` the review reads the live working tree (no snapshot, so `.git`
+is reachable); with `--base` the CLI exports a private snapshot with symlinks
+removed. `--exclude` limits the reviewed paths in both modes.
 
 ## 3. Present the results
 

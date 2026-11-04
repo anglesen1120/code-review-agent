@@ -273,3 +273,185 @@ test("gateFails thresholds", () => {
   assert.equal(gateFails(["Critical"], "none"), false);
   assert.equal(gateFails([], "warning"), false);
 });
+
+// ---- quick-action / link neutralization (S2, S3, S12) ----
+
+const quickActionLines = (text) => String(text).split("\n").filter((line) => /^[ \t]*\//.test(line));
+
+test("sanitize leaves fenced code byte-identical and neutralizes outside it", () => {
+  const text = [
+    "Lead in",
+    "```js",
+    "// comment",
+    "@Override",
+    "/approve",
+    "```",
+    "Tail",
+    "/merge",
+    "  /close @octocat",
+    "~~~",
+    "/not-an-action",
+    "~~~",
+  ].join("\n");
+  const s = sanitize(text);
+  const lines = s.split("\n");
+  // Inside fences: untouched, so a suggestion stays copy-pasteable.
+  assert.equal(lines[2], "// comment");
+  assert.equal(lines[3], "@Override");
+  assert.equal(lines[4], "/approve");
+  assert.equal(lines[10], "/not-an-action");
+  // Outside fences: neutralized.
+  assert.equal(lines[1], "```js");
+  assert.equal(lines[7], "\u200b/merge");
+  assert.equal(lines[8], "  \u200b/close @\u200boctocat");
+  assert.deepEqual(lines.slice(0, 1), ["Lead in"]);
+});
+
+test("an unclosed fence is closed so the thread marker cannot be swallowed", () => {
+  const body = markdownThread(F({ suggestion: "```js\nconst x = 1;" }));
+  const lines = body.split("\n");
+  const fences = lines.map((line, i) => (line.startsWith("```") ? i : -1)).filter((i) => i >= 0);
+  assert.equal(fences.length, 2, "opening and appended closing fence");
+  assert.equal(lines[fences[0]], "```js");
+  assert.equal(lines[fences[1]], "```");
+  const markerAt = lines.indexOf("<!-- code-review-agent -->");
+  assert.ok(markerAt > fences[1], "marker must be outside the fenced block");
+});
+
+test("a backtick-only title cannot open a fence in the heading", () => {
+  const body = markdownThread(F({ title: "```" }));
+  const lines = body.split("\n");
+  assert.equal(lines[1], "", "heading stays a single line");
+  assert.ok(lines[0].endsWith("```"));
+});
+
+const insideFenceAt = (text, needle) => {
+  let fence = null;
+  for (const line of String(text).split("\n")) {
+    if (line.includes(needle)) return Boolean(fence);
+    const open = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      const close = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.length) fence = null;
+      continue;
+    }
+    if (open && !open[2].includes(open[1][0])) fence = { char: open[1][0], length: open[1].length };
+  }
+  return false;
+};
+
+test("an invalid backtick info string does not hide the following quick actions", () => {
+  // CommonMark §4.5: a backtick in a backtick fence's info string makes the
+  // line an ordinary paragraph, so `/approve` below it is live text.
+  const s = sanitize("``` bad`info\n\n/approve\n  /merge");
+  assert.deepEqual(quickActionLines(s), []);
+  assert.ok(s.startsWith("``` bad`info\n"));
+  assert.match(s, /\n\u200b\/approve/);
+  assert.match(s, /\n  \u200b\/merge/);
+});
+
+test("truncation cannot strip the closing fence of a long description", () => {
+  const description = `${"a".repeat(3990)}\n\`\`\`js\n${"b".repeat(100)}`;
+  const body = markdownThread(F({ description }));
+  assert.equal(insideFenceAt(body, "<!-- code-review-agent -->"), false);
+  assert.equal(body.split("\n").filter((line) => line === "```").length, 1, "sanitize appended the closing fence");
+});
+
+test("summary notes neutralize every line, without a fenced-code exception", () => {
+  const md = markdownSummary({
+    summary: "s",
+    findings: [],
+    headSha: "abc1234",
+    unresolvedCount: 0,
+    notes: ["```js\n/approve\n/merge"],
+  });
+  assert.deepEqual(quickActionLines(md), []);
+  assert.ok(md.includes("</details>"));
+});
+
+test("truncation cannot strip the closing fence of a long summary", () => {
+  const md = markdownSummary({
+    summary: `${"s".repeat(3990)}\n\`\`\`js\n/approve`,
+    findings: [],
+    headSha: "abc1234",
+    unresolvedCount: 1,
+  });
+  assert.equal(insideFenceAt(md, "**Merge gate:**"), false);
+  assert.equal(insideFenceAt(md, "Reviewed `abc1234`"), false);
+});
+
+test("markdownThread neutralizes GitLab quick actions in description and suggestion", () => {
+  const body = markdownThread(
+    F({
+      title: "Guard\n/approve please",
+      description: "The guard is missing.\n/approve\n  /merge\n/milestone %\"v9\"",
+      suggestion: "Apply the guard.\n/close",
+    }),
+  );
+  assert.deepEqual(quickActionLines(body), []);
+  assert.match(body, /\u200b\/approve/);
+  assert.match(body, /\u200b\/merge/);
+  assert.match(body, /\u200b\/close/);
+  assert.match(body, /\u200b\/milestone/);
+  assert.match(body, /<!-- code-review-agent -->\n?$/);
+});
+
+test("thread titles with newlines stay on the heading line and keep the thread key stable", () => {
+  const f = F({ title: "Block\n/approve in the gate" });
+  const body = markdownThread(f);
+  assert.deepEqual(quickActionLines(body), []);
+  const parsed = parseThreadBody(body);
+  assert.equal(parsed.severity, "Warning");
+  assert.equal(parsed.title, "Block /approve in the gate");
+  assert.equal(normalizeTitle(parsed.title), normalizeTitle(f.title));
+  assert.equal(threadKey({ ...f, title: parsed.title }), threadKey(f));
+});
+
+test("markdownSummary neutralizes quick actions in summary, findings, notes and titles", () => {
+  const md = markdownSummary({
+    summary: "Overview\n/approve\n/merge",
+    findings: [
+      F({ severity: "Critical", category: "security", title: "Gate\n/merge bypass", description: "bad\n/approve", suggestion: "x\n/close" }),
+    ],
+    headSha: "abc1234",
+    unresolvedCount: 1,
+    notes: ["Diff capped\n/approve"],
+  });
+  assert.deepEqual(quickActionLines(md), []);
+  assert.equal(parseReviewedSha(md), "abc1234");
+  assert.match(md, /\u200b\/approve/);
+  assert.match(md, /\u200b\/merge/);
+});
+
+test("markdownSummary renders a hostile filename inert instead of opening a link", () => {
+  const file = "src/](https://evil)";
+  const md = markdownSummary({
+    summary: "s",
+    findings: [F({ file, line: 7 })],
+    headSha: "abc1234",
+    unresolvedCount: 0,
+    fileUrl: (f, line) => `https://example.test/blob/abc1234/${encodeURIComponent(f)}#L${line}`,
+  });
+  assert.ok(!md.includes("](https://evil)"), "the injected link must not survive");
+  assert.match(md, /`src\/%5D\(https:\/\/evil\):7`/);
+  assert.ok(md.includes("](https://example.test/blob/abc1234/src%2F%5D(https%3A%2F%2Fevil)#L7)"));
+});
+
+test("markdownSummary caps the body below the GitLab/GitHub comment limit", () => {
+  const big = "d".repeat(5000);
+  const findings = Array.from({ length: 400 }, (_, i) =>
+    F({ severity: i % 2 ? "Warning" : "Info", line: i + 1, title: `t${"x".repeat(500)}`, description: big }),
+  );
+  const md = markdownSummary({
+    summary: "s".repeat(9000),
+    findings,
+    headSha: "abc1234",
+    unresolvedCount: 0,
+    notes: ["n".repeat(4000)],
+  });
+  assert.ok(md.length < 60000, `body is ${md.length} chars`);
+  assert.ok(md.length <= 59000);
+  assert.match(md, /finding\(s\) omitted/);
+  assert.ok(md.startsWith("<!-- code-review-agent:summary -->"));
+  assert.equal(parseReviewedSha(md), "abc1234");
+});

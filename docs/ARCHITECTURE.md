@@ -77,8 +77,11 @@ Zero runtime npm dependencies: global `fetch`, `node:fs`, `node:child_process`,
    excluded, plus `--exclude`/`CRA_EXCLUDE` pathspecs.
 4. **Diff budget.** `capDiff` keeps a prefix of complete files up to
    `--max-diff-bytes` (default 250000) and never truncates a hunk. Skipped files
-   are named in the summary notes, so a partial review is visible rather than
-   silent.
+   are named in the summary notes, and their existing threads are kept open — an
+   unreviewed file is not evidence that a finding was fixed. When the **whole**
+   diff is over budget, nothing is posted or resolved, the summary says the diff
+   was not reviewed (never "no code changes"), the reviewed-SHA marker does not
+   advance, and the run exits `1` regardless of `--fail-on`.
 5. `parseUnifiedDiff` builds `Map<path, Map<newLine, {type, oldLine}>>` — the
    only lines that can anchor an inline comment. GitLab additionally needs the
    old-side line for context lines, hence `oldLine`.
@@ -107,23 +110,41 @@ The adapter returns `{ threads, lastReviewedSha }`.
 1. Generates `opencode.json` in the scratch dir: an OpenAI-compatible provider
    block (`base-url`, `model`, key referenced as `{env:CRA_API_KEY}`) and a
    `code-reviewer` agent with **deny-by-default** permissions. Allowed: `read`,
-   `glob`, `grep`, `lsp`, `todowrite`. Denied: everything else, including
-   `bash`, `edit`, `webfetch`, `websearch`, `task`, `skill`, `question`.
-   Reads deny `.env`, `.env.*` (except `.env.example`), `.git/`, `*.pem`,
-   `*id_rsa*`, `*.p12`;
-   `external_directory` allows only the scratch dir.
+   `glob`, `grep`, `todowrite`, plus `external_directory` for the scratch dir.
+   Denied: everything else, including `bash`, `edit`, `webfetch`, `websearch`,
+   `task`, `skill`, `question`, `doom_loop` and `lsp`. Reads deny `.env`,
+   `.env.*` (except `.env.example`), `.git/`, `*.pem`, `*id_rsa*`, `*.p12`.
+   The config also sets `autoupdate: false`, `share: "disabled"`,
+   `snapshot: false`, `lsp: false` and `permission.lsp: "deny"` (all verified
+   against opencode 1.18.18). `provider.npm` stays the exact string
+   `@ai-sdk/openai-compatible`: that version matches it to pick the native
+   adapter, so a pinned `pkg@version` spec is rejected.
 2. Spawns `opencode run --agent code-reviewer --format json --model …` with a
-   **child environment allow-list** (`childEnv`): no CI tokens, only
+   **child environment allow-list** (`childEnv`): no CI tokens, no inherited
+   `OPENCODE_*` variable (a parent `OPENCODE_CONFIG_CONTENT` or
+   `OPENCODE_PERMISSION` would override the hardened config), only
    `CRA_API_KEY`, `OPENCODE_CONFIG` and runtime/proxy/TLS variables, plus
-   `OPENCODE_DISABLE_PROJECT_CONFIG=1` so consumer repo config cannot steer the
-   model.
+   `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_DISABLE_AUTOUPDATE=1`,
+   `OPENCODE_DISABLE_LSP_DOWNLOAD=1` and `OPENCODE_DISABLE_DEFAULT_PLUGINS=1`.
 3. `extractFindings` joins the `text` events and tries, in order: the whole
    text, each fenced block, each balanced `{…}` span. The first candidate that
    normalizes and validates wins.
 4. **Retry / degrade.** One retry with a stricter "output ONLY JSON"
    instruction. If that fails too, the analyzer returns `error` (no throw); the
-   caller decides what that means — see below.
+   caller decides what that means — see below. A non-zero exit or signal is a
+   failed attempt **even when stdout carried valid JSON**; the error reads
+   `analysis failed: …` (as opposed to `analysis produced invalid findings: …`
+   when the process exits 0 with unusable output).
 5. Empty diff → no model call at all.
+
+The API key and every non-empty environment value whose name matches
+`/(TOKEN|KEY|SECRET|PASSWORD)/i` are replaced with `[REDACTED]` in the attempt
+log, stderr/event tails and returned errors. Matching also covers the trimmed and
+per-line form of multi-line values, their JSON-escaped form, and
+`user:password` inside `HTTPS_PROXY`/`https_proxy`; longest values are replaced
+first, and tails are scrubbed before the last N lines are cut. The
+`events.jsonl` and `opencode.err` files written to the scratch dir are **not**
+redacted.
 
 Timeout: `CRA_ANALYZE_TIMEOUT_MS` (default 15 min) per attempt, enforced with
 `SIGKILL`.
@@ -151,8 +172,20 @@ Pure functions; no I/O, no model, no execution of comment text.
   platform marks outdated.
 - `gateFails(severities, failOn)` — `critical` matches Critical; `warning`
   matches Critical or Warning.
-- `sanitize` breaks `@mentions` and escapes HTML comments before model text is
-  rendered into a thread or summary.
+- `sanitize` breaks `@mentions`, escapes HTML comments and prefixes a line whose
+  first non-space character is `/` with a zero-width space (GitLab quick
+  actions), before model text is rendered into a thread, summary, note or the
+  Markdown report. It is fence-aware: CommonMark fenced blocks in finding text
+  are left byte-identical, and an unterminated fence gets a closing line so the
+  agent markers that follow are not swallowed. Summary notes are neutralized on
+  every line. Control characters and `<!--` are handled everywhere, including
+  inside fences.
+- `normalizePath` drops a finding whose path contains control characters or
+  newlines; `normalizeFindings` caps title at 200 and description/suggestion at
+  4000 characters (truncated with `…`), and `markdownSummary` holds the body
+  under 59000 characters with an "_N finding(s) omitted…_" note. Summary link
+  labels are code spans with `[`/`]` percent-encoded, so a filename cannot forge
+  a link.
 - `markdownSummary` writes the summary marker, the reviewed-SHA marker, counts,
   per-severity lists, notes and the merge-gate line.
 
@@ -161,34 +194,54 @@ Pure functions; no I/O, no model, no execution of comment text.
 1. Parse flags/env (`resolveOptions`); invalid values exit `2` with usage.
 2. Create the adapter (`null` for `none`); a missing platform token or MR
    context exits `2`.
-3. Diff, cap, index; fetch existing threads (exit `1` on failure).
+3. Diff, cap, index; fetch existing threads (exit `1` on failure). The analysis
+   snapshot is a private `mkdtemp` directory outside the checkout with its own
+   `git init`, symlinks removed after the export, deleted at the end of the run;
+   scratch files stay in the out-dir (`.review` for `analyze`, `.cra` on GitLab,
+   `$RUNNER_TEMP/cra` when set, otherwise a private temp dir).
 4. Analyze.
 5. **A failed analysis posts nothing and resolves nothing.** The existing
    threads keep blocking the merge, the summary records the failure and points
-   at the job log, and `--fail-on` (when not `none`) exits `1` — fail closed.
-   An empty-findings result is only trusted when the analysis succeeded.
+   at the job log, the reviewed-SHA marker keeps its previous value (or is
+   omitted), and `--fail-on` (when not `none`) exits `1` — fail closed. An
+   empty-findings result is only trusted when the analysis succeeded.
 6. Findings are split by anchor: those whose line is inside a diff hunk become
    inline threads; the rest go to the **summary only** (non-Info ones are listed
-   in the notes and still count for the gate).
+   in the notes and still count for the gate). Findings in files skipped by the
+   diff budget never resolve a thread, and a fully skipped diff resolves
+   nothing and exits `1`.
 7. Post, then resolve, then compute the gate from **actual outcomes** (posted
-   threads, threads that failed to resolve), not from the plan.
+   threads, threads that failed to resolve), not from the plan. A matched thread
+   is gated at the current finding's severity, not only the stale severity parsed
+   from the existing thread body.
 8. Upsert one summary comment (idempotent via marker); optionally set the
    `code-review-agent` commit status (failure when the analysis failed or the
-   gate matches, using `warning` semantics when `--fail-on none`).
+   gate matches, using `warning` semantics when `--fail-on none`). If the status
+   call fails, the reports are still written and the run exits `1`.
 9. Write report files and outputs: `--sarif`, `--codequality`, `--markdown`,
    `--json`, `GITHUB_STEP_SUMMARY`, `GITHUB_OUTPUT`, plus `result.json` and
-   `findings.json` in the scratch dir.
+   `findings.json` in the scratch dir. Model text printed to the console is
+   neutralized for CI workflow commands.
 
-Exit codes: `0` ok · `1` gate failed, analysis failed with `--fail-on` set, or
-no thread could be posted on a platform adapter · `2` usage/configuration error.
+Exit codes: `0` ok · `1` gate failed, analysis failed with `--fail-on` set, no
+thread could be posted, existing threads could not be read, the commit status
+could not be delivered, or the whole diff exceeded the budget and nothing was
+reviewed · `2` usage/configuration error.
 
 ## Security model
 
+- The review is advisory, not a security control: an injected PR can make the
+  model report nothing, so it complements human review and deterministic
+  scanners rather than replacing them.
 - The analyzer is deny-by-default and read-only; the diff and the repository are
   treated as untrusted data.
-- The model process never sees CI tokens: the child env is an allow-list.
+- The model process never sees CI tokens: the child env is an allow-list that
+  also drops inherited `OPENCODE_*` variables.
 - Consumer repo config (`opencode.json`, `AGENTS.md`) is not loaded.
-- Model text is sanitized before posting; markers cannot be forged.
+- The snapshot is a private temp dir with `git init`, symlinks removed, and no
+  checkout `.git` or untracked files.
+- Model text is sanitized before posting (mentions, HTML comments, quick
+  actions) and neutralized on the console; markers cannot be forged.
 - The lifecycle never interprets comment text — only normalized keys.
 - Adapters never put tokens in URLs and redact them from error messages.
 - Threads are posted with the platform token, from the parent process only.

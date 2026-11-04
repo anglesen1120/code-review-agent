@@ -27,6 +27,8 @@ const RETRY_BASE_MS = 250;
 // instead of stalling the CI job for hours (or overflowing setTimeout).
 const MAX_RETRY_DELAY_MS = 60_000;
 const MAX_RETRY_AFTER_MS = 120_000;
+const MAX_RATE_LIMIT_WAIT_MS = 60_000;
+const RESOLVE_INTERVAL_MS = 250;
 const MAX_PAGES = 1_000;
 const PER_PAGE = 100;
 const STATUS_CONTEXT = "code-review-agent";
@@ -214,13 +216,13 @@ function resolveNextPageUrl(linkHeader, apiUrl) {
   return resolved.href;
 }
 
-function parseRetryAfter(value) {
+function parseRetryAfter(value, now) {
   if (value == null) return null;
   const raw = String(value).trim();
   if (!raw) return null;
   if (/^\d+$/.test(raw)) return Number(raw) * 1000;
   const at = Date.parse(raw);
-  if (Number.isFinite(at)) return Math.max(0, at - Date.now());
+  if (Number.isFinite(at)) return Math.max(0, at - now);
   return null;
 }
 
@@ -242,6 +244,7 @@ const isAbsoluteUrl = (value) => /^https?:\/\//i.test(value);
  * @param {(msg:string)=>void} [options.log] never receives secrets
  * @param {(ms:number)=>Promise<void>} [options.sleep] injected by tests
  * @param {number} [options.retryBaseMs]
+ * @param {()=>number} [options.now] injected clock in milliseconds
  */
 export function createGitHubPlatform({
   env = process.env,
@@ -249,6 +252,7 @@ export function createGitHubPlatform({
   log = console.error,
   sleep,
   retryBaseMs = RETRY_BASE_MS,
+  now = Date.now,
 } = {}) {
   const token = nonEmpty(env.GITHUB_TOKEN)
     ? env.GITHUB_TOKEN.trim()
@@ -348,12 +352,13 @@ export function createGitHubPlatform({
     return status ? `HTTP ${status}` : "";
   }
 
-  /** JSON request with retry on 429/5xx/network errors; fail fast on other 4xx. */
+  /** JSON request with bounded retries, including GitHub secondary rate limits. */
   async function request(method, pathOrUrl, body) {
     const url = absoluteUrl(pathOrUrl);
     const path = labelFor(pathOrUrl, url);
     const hasBody = body !== undefined;
     let lastError = null;
+    let rateLimitWait = 0;
 
     for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt += 1) {
       let res;
@@ -401,16 +406,32 @@ export function createGitHubPlatform({
         `GitHub ${method} ${path} failed with status ${status}${detail ? `: ${detail}` : ""}`,
         { method, path, status, body: detail },
       );
-      const retryable = status === 429 || status >= 500;
+      const retryAfter = headerValue(res?.headers, "retry-after");
+      const remaining = String(headerValue(res?.headers, "x-ratelimit-remaining") ?? "").trim();
+      const rateLimited = status === 403 && (retryAfter != null
+        || remaining === "0" || /secondary rate limit/i.test(detail));
+      const retryable = status === 429 || status >= 500 || rateLimited;
       if (retryable && attempt < RETRY_ATTEMPTS) {
-        const requested = parseRetryAfter(headerValue(res?.headers, "retry-after"));
+        const requested = parseRetryAfter(retryAfter, now());
         if (requested != null && requested > MAX_RETRY_AFTER_MS) {
           throw new GitHubApiError(
             `${lastError.message}; refusing a ${requested}ms Retry-After (limit ${MAX_RETRY_AFTER_MS}ms)`,
             { method, path, status, body: detail },
           );
         }
-        const delay = requested ?? backoff(attempt);
+        const reset = headerValue(res?.headers, "x-ratelimit-reset");
+        const resetAt = reset == null || String(reset).trim() === "" ? NaN : Number(reset) * 1000;
+        const resetDelay = remaining === "0" && Number.isFinite(resetAt) ? Math.max(0, resetAt - now()) : null;
+        const delay = requested ?? resetDelay ?? backoff(attempt);
+        if (rateLimited) {
+          if (delay > MAX_RATE_LIMIT_WAIT_MS - rateLimitWait) {
+            throw new GitHubApiError(
+              `${lastError.message}; rate-limit retry wait would exceed ${MAX_RATE_LIMIT_WAIT_MS}ms total`,
+              { method, path, status, body: detail },
+            );
+          }
+          rateLimitWait += delay;
+        }
         logLine(`code-review-agent: ${lastError.message}; retrying in ${delay}ms (${attempt}/${RETRY_ATTEMPTS})`);
         await pause(delay);
         continue;
@@ -645,11 +666,21 @@ export function createGitHubPlatform({
     }
     return { posted, failed, reviewId };
   }
+  let resolveQueue = Promise.resolve();
+  let lastResolveAt = null;
 
   async function resolveThread(thread) {
     const id = thread?.id;
     if (!id) throw new Error("GitHub adapter: resolveThread requires a thread id");
-    await graphql(RESOLVE_THREAD_MUTATION, { id });
+    const pending = resolveQueue.then(async () => {
+      const delay = lastResolveAt == null ? 0 : Math.max(0, RESOLVE_INTERVAL_MS - (now() - lastResolveAt));
+      if (delay > 0) await pause(delay);
+      lastResolveAt = now();
+      await graphql(RESOLVE_THREAD_MUTATION, { id });
+    });
+    // A failed mutation must not prevent later threads from being resolved.
+    resolveQueue = pending.catch(() => {});
+    await pending;
   }
 
   async function upsertSummary(body) {

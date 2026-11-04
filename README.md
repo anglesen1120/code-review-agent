@@ -117,8 +117,13 @@ Auto-resolve is deliberately conservative — see
 
 ```yaml
 include:
-  - remote: 'https://raw.githubusercontent.com/anglesen1120/code-review-agent/main/ci/gitlab/code-review.gitlab-ci.yml'
+  - remote: 'https://raw.githubusercontent.com/anglesen1120/code-review-agent/<tag-or-sha>/ci/gitlab/code-review.gitlab-ci.yml'
 ```
+
+Replace `<tag-or-sha>` with a release tag or commit SHA that contains the
+template (the `v1` tag predates it), never a moving branch: a remote include is
+code that runs with your CI variables. The same applies to `ref:` when the
+template lives in another project.
 
 Add masked CI/CD variables `CRA_API_KEY` and `GITLAB_TOKEN` (project or group
 access token, role Developer+, scope `api`; `CI_JOB_TOKEN` cannot post MR
@@ -129,9 +134,12 @@ Quality report. Details in
 ### Docker / any other CI
 
 The image `ghcr.io/anglesen1120/code-review-agent:latest` ships `cra` on `PATH`
-(non-root uid 10001, `WORKDIR /workspace`, entrypoint `cra`):
+(non-root uid 10001, `WORKDIR /workspace`, entrypoint `cra`). Pin it by version
+tag or digest in CI — `:latest` is mutable, so a re-pull can change what runs
+against your repository:
 
 ```bash
+# Pin the tag (or use @sha256:<digest>); :latest is mutable.
 docker run --rm -v "$PWD:/workspace" -w /workspace \
   -e CRA_API_KEY=<provider-key> \
   ghcr.io/anglesen1120/code-review-agent:latest \
@@ -181,7 +189,9 @@ re-posting, but nobody (agent included) can auto-resolve them from CI.
 | `review-id` | GitHub review id created this run, if any. |
 | `analysis-failed` | `true` when the analyzer could not produce valid findings. |
 
-CLI exit codes: `0` ok, `1` gate failed or nothing could be delivered, `2`
+CLI exit codes: `0` ok · `1` gate failed, nothing could be delivered (no thread
+posted, existing threads unreadable, commit status could not be set), or the
+whole diff exceeded the budget and nothing was reviewed · `2`
 usage/configuration error.
 
 ## Findings schema
@@ -203,19 +213,29 @@ untrusted-input rule and a .NET/Clean Architecture checklist for .NET repos.
 
 ## Security model
 
+The review is **advisory**. It is not a security control and not an adversarial
+boundary: a pull request can contain instructions that make the model report
+nothing, and a model can miss a real vulnerability. Run it alongside human review
+and deterministic scanners (SAST, dependency and secret scanning); never make
+it the only check before merge.
+
 The diff is **untrusted input**: a PR can contain text that tries to steer the
 reviewer. The design assumes it does.
 
 - **Deny-by-default analyzer agent.** The generated `opencode.json` starts with
-  `"*": "deny"` and re-allows only `read`, `glob`, `grep`, `lsp` and
-  `todowrite`. `bash`, `edit`, `webfetch`, `websearch`, `task`, `skill` and
-  `question` stay denied, so there is no shell and no exfiltration channel.
-- **Clean snapshot.** `cra review` exports the head commit with `git archive`
-  into `<out-dir>/src` and runs the analyzer there: no `.git` (the checkout's
-  `.git/config` can hold the CI token), no untracked or ignored files. Files
-  marked `export-ignore` are absent from the snapshot. `cra analyze` without
-  `--base` reviews the live working tree instead (local use only: `grep` can
-  still reach `.git` there).
+  `"*": "deny"` and re-allows only `read`, `glob`, `grep` and `todowrite`.
+  `bash`, `edit`, `webfetch`, `websearch`, `task`, `skill`, `question`,
+  `doom_loop` and `lsp` stay denied, so there is no shell and no exfiltration
+  channel. The config also sets `autoupdate: false`, `share: "disabled"`,
+  `snapshot: false`, `lsp: false` and `permission.lsp: "deny"`.
+- **Hardened snapshot.** `cra review` exports the head commit with `git archive`
+  into a fresh private directory (`mkdtemp`, mode 0700) **outside** the
+  checkout, runs `git init -q` inside it so the analyzer's worktree is the
+  snapshot itself, and deletes the directory at the end of the run. After the
+  export every symlink is removed (and counted in the summary notes), so a
+  committed link cannot point the model at `$HOME`, `/etc` or the checkout.
+  There is no `.git` from the checkout (its `.git/config` can hold the CI
+  token), and untracked, ignored and `export-ignore` files are absent.
 - **Read restrictions.** Reads are limited to the analysis root, minus `.env`,
   `.env.*` (except `.env.example`), `.git/`, `*.pem`, `*id_rsa*` and `*.p12`.
   `external_directory` is denied except for the scratch directory that holds the
@@ -223,22 +243,64 @@ reviewer. The design assumes it does.
   runner credentials stay closed. Verified live against opencode 1.18.18: reads
   of `.git/config`, `.env`, `~/.zshrc` and `grep`/`glob` on `/etc` are refused.
 - **Child environment allow-list.** The analyzer spawns opencode with a fixed
-  allow-list of variables (`PATH`, `HOME`, `LANG`, proxy and TLS bundle
-  variables, `OPENCODE_*`, …) plus `CRA_API_KEY` and `OPENCODE_CONFIG`. CI
-  tokens (`GITHUB_TOKEN`, `GITLAB_TOKEN`) are **never** passed to the model
-  process.
+  allow-list of variables and forwards **no** inherited `OPENCODE_*` variable:
+  a parent `OPENCODE_CONFIG_CONTENT`, `OPENCODE_PERMISSION`,
+  `OPENCODE_CONFIG_DIR` or `OPENCODE_AUTO_SHARE` would otherwise override the
+  hardened config (verified with opencode 1.18.18: `OPENCODE_CONFIG_CONTENT`
+  flipped `share` back to `auto`). It sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`,
+  `OPENCODE_DISABLE_AUTOUPDATE=1`, `OPENCODE_DISABLE_LSP_DOWNLOAD=1` and
+  `OPENCODE_DISABLE_DEFAULT_PLUGINS=1`, plus `CRA_API_KEY` and
+  `OPENCODE_CONFIG`. CI tokens (`GITHUB_TOKEN`, `GITLAB_TOKEN`) are **never**
+  passed to the model process, and the API key plus any
+  `TOKEN`/`KEY`/`SECRET`/`PASSWORD` environment value (trimmed, per-line,
+  JSON-escaped and proxy-credential forms included) is replaced with
+  `[REDACTED]` in the attempt log, the stderr/event tails and returned error
+  messages. The `events.jsonl` / `opencode.err` files left in the scratch dir
+  are **not** redacted: treat that directory as sensitive and let the CI
+  artifact rules drop it.
 - **Repository config is ignored.** `OPENCODE_DISABLE_PROJECT_CONFIG=1` stops
   the consumer repo's `opencode.json` / `AGENTS.md` from being loaded at all.
-- **Model text is sanitized.** Before anything reaches a PR, `@mentions` are
-  broken with a zero-width space and `<!--` is escaped, so injected output
-  cannot ping users or forge the agent's own markers.
+- **Model text is neutralized and bounded.** Before anything reaches a PR,
+  `@mentions` are broken with a zero-width space, `<!--` is escaped, and a line
+  whose first non-space character is `/` gets a zero-width space inserted before
+  the slash so GitLab cannot execute it as a quick action. Neutralization is
+  fence-aware: lines inside a CommonMark fenced block are left byte-identical
+  (suggestions stay copy-pasteable; GitLab only scans paragraphs for quick
+  actions), while an unterminated fence gets a closing line so the agent markers
+  are never swallowed. Summary notes (skipped files, dropped findings, adapter
+  errors) are neutralized on every line. Control characters are stripped and
+  `<!--` is escaped everywhere, including fences. Model text printed to
+  stdout/stderr has CI workflow commands (`::…`, `##vso[…]`, `##[…]`) defused
+  and ANSI/control characters stripped, so a finding cannot inject commands into
+  the job log. Written report files are unaffected. Field lengths are capped
+  (title 200, description/suggestion 4000 characters, truncated with `…`), the
+  summary body
+  is held under 59000 characters with an explicit "N finding(s) omitted" note,
+  finding paths with control characters or newlines are dropped, and link labels
+  are code spans with `[`/`]` percent-encoded so a filename cannot forge a link.
 - **The lifecycle never executes text.** Thread dedupe and resolution compare
   normalized keys only; comment bodies are data, not instructions.
+- **Fail closed.** An opencode process that exits non-zero (or is killed) is a
+  failed analysis even if it printed parseable JSON. A failed analysis posts and
+  resolves nothing, keeps the previous reviewed-SHA marker, and fails the run
+  when `--fail-on` is not `none`. Delivery failures are always fatal: no thread
+  posted, existing threads unreadable, or a commit status that could not be set
+  with `--set-status` exits `1` after the report files are written.
+- **Partial reviews stay visible.** Files skipped by `--max-diff-bytes` are
+  named in the summary and their threads stay open — an unreviewed file is not
+  evidence that an issue was fixed. When the whole diff is over budget nothing
+  is posted or resolved, the summary says the diff was not reviewed, and the run
+  exits `1` regardless of `--fail-on`.
+- **Local working-tree caveat.** `cra analyze` without `--base` reviews the live
+  working tree, not a snapshot: `grep` can still reach `.git`, and
+  `--exclude`/`CRA_EXCLUDE` limits what is reviewed but does not sandbox the
+  filesystem. Use it for local review only; CI runs should use `cra review`.
 - **Workflow hygiene.** Use `persist-credentials: false` on `actions/checkout`
   so the checkout credential is not left in `.git/config` while untrusted code
   is analysed. Never run this workflow on `pull_request_target` with a checkout
   of the PR head: that combination exposes repository secrets to code the PR
-  author controls.
+  author controls. Pin the image by tag or digest and a remote include by
+  tag/SHA (see [`docs/CI-INTEGRATIONS.md`](docs/CI-INTEGRATIONS.md)).
 - **Token scope.** Give the platform token the minimum listed in
   [`docs/CI-INTEGRATIONS.md`](docs/CI-INTEGRATIONS.md#token-permissions). The
   API key is only ever read from the environment and written into the generated

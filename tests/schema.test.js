@@ -85,3 +85,52 @@ test("normalizeFindings passes non-objects through for validation to reject", ()
   assert.equal(normalizeFindings(null).data, null);
   assert.equal(validateFindings(normalizeFindings([]).data).ok, false);
 });
+
+test("normalizePath rejects control characters and newlines in file names", () => {
+  assert.equal(normalizePath("src/a\nb.js"), null);
+  assert.equal(normalizePath("src/a\rb.js"), null);
+  assert.equal(normalizePath("src/a\u0000b.js"), null);
+  assert.equal(normalizePath("src/a\u009fb.js"), null);
+  assert.equal(normalizePath("src/a\u2028b.js"), null);
+  // Surrounding whitespace is still repaired, not rejected.
+  assert.equal(normalizePath("src/a.js\n"), "src/a.js");
+});
+
+test("validateFindings rejects a file name containing a newline", () => {
+  const bad = structuredClone(sample);
+  bad.findings[0].file = "src/a.js\n[/approve](https://evil)";
+  const r = validateFindings(bad);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.includes("control characters")));
+});
+
+test("normalizeFindings drops findings whose path contains a control character", () => {
+  const { data, dropped } = normalizeFindings({
+    summary: "s",
+    findings: [{ ...sample.findings[0], file: "src/a\nb.js" }],
+  });
+  assert.equal(data.findings.length, 0);
+  assert.match(dropped[0], /control characters or newlines/);
+});
+
+test("normalizeFindings truncates over-long fields with an ellipsis", () => {
+  const long = "x".repeat(5000);
+  const finding = { ...sample.findings[0], title: "T".repeat(500), description: long, suggestion: long };
+  const { data } = normalizeFindings({ summary: long, findings: [finding] });
+  assert.equal(data.summary.length, 4000);
+  assert.ok(data.summary.endsWith("…"));
+  assert.equal(data.findings[0].title.length, 200);
+  assert.ok(data.findings[0].title.endsWith("…"));
+  assert.equal(data.findings[0].description.length, 4000);
+  assert.equal(data.findings[0].suggestion.length, 4000);
+  assert.ok(data.findings[0].description.endsWith("…"));
+  // Truncation is a repair, not a rejection: the result still validates.
+  assert.equal(validateFindings(data).ok, true);
+});
+
+test("normalizeFindings leaves fields at or under the caps untouched", () => {
+  const finding = { ...sample.findings[0], title: "T".repeat(200), description: "d".repeat(4000) };
+  const { data } = normalizeFindings({ summary: "s", findings: [finding] });
+  assert.equal(data.findings[0].title, finding.title);
+  assert.equal(data.findings[0].description, finding.description);
+});

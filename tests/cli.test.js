@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { run } from "../bin/cra.js";
+import { fileURLToPath } from "node:url";
+import { run, safeConsole } from "../bin/cra.js";
 import { markdownThread, parseThreadBody, threadKey } from "../src/lifecycle.js";
 
 const git = (cwd, ...args) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -158,18 +159,27 @@ test("nothing deliverable exits 1", async () => {
   assert.match(r.logs, /no review thread could be posted/);
 });
 
-test("analyzer runs in a clean snapshot of head: tracked files only, no .git", async () => {
+test("analyzer runs in a private snapshot of head: tracked files only, own empty repo", async () => {
   const repo = makeRepo();
   writeFileSync(join(repo.dir, ".env"), "SECRET=1\n"); // untracked
   let seen;
   const r = await review(repo, ["--platform", "none"], {
     analyze: async ({ workspace }) => {
-      seen = { git: existsSync(join(workspace, ".git")), env: existsSync(join(workspace, ".env")), a: readFileSync(join(workspace, "a.js"), "utf8") };
+      const gitConfig = existsSync(join(workspace, ".git", "config")) ? readFileSync(join(workspace, ".git", "config"), "utf8") : "";
+      seen = {
+        workspace,
+        env: existsSync(join(workspace, ".env")),
+        a: readFileSync(join(workspace, "a.js"), "utf8"),
+        // The snapshot's own repo must not point anywhere (no CI token in a remote URL).
+        remote: /\[remote|token|url\s*=/i.test(gitConfig),
+      };
       return { data: { summary: "s", findings: [] }, error: null, dropped: [] };
     },
   });
   assert.equal(r.code, 0);
-  assert.deepEqual(seen, { git: false, env: false, a: "l1\nl2\nCHANGED\nl4\nl5\n" });
+  assert.deepEqual({ env: seen.env, a: seen.a, remote: seen.remote }, { env: false, a: "l1\nl2\nCHANGED\nl4\nl5\n", remote: false });
+  assert.equal(seen.workspace.startsWith(repo.dir + "/"), false, "snapshot lives outside the checkout");
+  assert.equal(existsSync(seen.workspace), false, "snapshot is removed after the run");
 });
 
 test("dry-run prints the plan and writes nothing to the platform", async () => {
@@ -186,4 +196,241 @@ test("dry-run prints the plan and writes nothing to the platform", async () => {
 
 test("thread bodies written by markdownThread are recognised on the next run", () => {
   assert.equal(parseThreadBody(markdownThread(F())).title, "Broken thing");
+});
+
+/** Repo whose single changed file is far larger than the 1000-byte budget floor. */
+function makeBigRepo({ withSmallChange = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "cra-big-"));
+  git(dir, "init", "-q", "-b", "main");
+  git(dir, "config", "user.email", "t@t");
+  git(dir, "config", "user.name", "t");
+  writeFileSync(join(dir, "a.js"), "l1\nl2\nl3\nl4\nl5\n");
+  writeFileSync(join(dir, "big.js"), Array.from({ length: 200 }, (_, i) => `old line ${i} padding padding\n`).join(""));
+  git(dir, "add", ".");
+  git(dir, "commit", "-qm", "base");
+  const base = git(dir, "rev-parse", "HEAD");
+  if (withSmallChange) writeFileSync(join(dir, "a.js"), "l1\nl2\nCHANGED\nl4\nl5\n");
+  writeFileSync(join(dir, "big.js"), Array.from({ length: 200 }, (_, i) => `new line ${i} padding padding padding\n`).join(""));
+  git(dir, "commit", "-qam", "head");
+  return { dir, base, head: git(dir, "rev-parse", "HEAD") };
+}
+
+test("an entirely over-budget diff reviews nothing: threads stay open and the run fails closed", async () => {
+  const repo = makeBigRepo();
+  const { p, calls } = fakePlatform({ threads: [thread({ path: "big.js", line: 2 })], lastReviewedSha: repo.base });
+  let analyzed = false;
+  const r = await review(repo, ["--max-diff-bytes", "1000", "--fail-on", "critical"], {
+    analyze: async () => { analyzed = true; return okAnalysis([]); },
+    platformFactory: () => p,
+  });
+  assert.equal(analyzed, false, "no model call when nothing is reviewable");
+  assert.equal(r.code, 1);
+  assert.deepEqual(calls.resolved, []);
+  assert.deepEqual(calls.posted, []);
+  assert.match(calls.summary, /not reviewed/i);
+  assert.doesNotMatch(calls.summary, /No code changes/);
+  // Nothing was reviewed, so the marker must not advance.
+  assert.match(calls.summary, new RegExp(`reviewed-sha=${repo.base}`));
+  assert.doesNotMatch(calls.summary, new RegExp(`reviewed-sha=${repo.head}`));
+});
+
+test("a change in a budget-skipped file is no evidence that its thread is fixed", async () => {
+  const repo = makeBigRepo({ withSmallChange: true });
+  const { p, calls } = fakePlatform({ threads: [thread({ path: "big.js", line: 2 })], lastReviewedSha: repo.base });
+  const r = await review(repo, ["--max-diff-bytes", "1000"], { analyze: okAnalysis([]), platformFactory: () => p });
+  assert.deepEqual(calls.resolved, [], "skipped file must not resolve its thread");
+  assert.match(calls.summary, /1 unresolved/);
+  assert.equal(r.code, 0);
+});
+
+test("a finding that escalates an existing thread fails the gate at its current severity", async () => {
+  const repo = makeRepo();
+  const { p, calls } = fakePlatform({ threads: [thread({ severity: "Warning" })], lastReviewedSha: repo.head });
+  const r = await review(repo, ["--fail-on", "critical", "--set-status"], {
+    analyze: okAnalysis([F({ severity: "Critical" })]),
+    platformFactory: () => p,
+  });
+  assert.deepEqual(calls.resolved, []);
+  assert.deepEqual(calls.posted, []);
+  assert.equal(calls.status.state, "failure");
+  assert.equal(r.code, 1);
+});
+
+test("an unanchored Critical finding sets the commit status to failure", async () => {
+  const repo = makeRepo();
+  const { p, calls } = fakePlatform();
+  const r = await review(repo, ["--set-status"], {
+    analyze: okAnalysis([F({ file: "zzz.js", line: 1, title: "Not in diff" })]),
+    platformFactory: () => p,
+  });
+  assert.equal(calls.status.state, "failure");
+  assert.equal(r.code, 0);
+});
+
+test("a failed analysis keeps the previous reviewed-sha marker", async () => {
+  const repo = makeRepo();
+  const { p, calls } = fakePlatform({ threads: [thread()], lastReviewedSha: repo.base });
+  const r = await review(repo, [], { analyze: async () => ({ data: null, error: "boom", dropped: [] }), platformFactory: () => p });
+  assert.equal(r.code, 0);
+  assert.match(calls.summary, new RegExp(`reviewed-sha=${repo.base}`));
+  assert.doesNotMatch(calls.summary, new RegExp(`reviewed-sha=${repo.head}`));
+});
+
+test("a failing status API call exits 1 after the reports are written", async () => {
+  const repo = makeRepo();
+  const { p } = fakePlatform();
+  p.setStatus = async () => { throw new Error("403"); };
+  const markdown = join(repo.dir, "report.md");
+  const r = await review(repo, ["--set-status", "--markdown", markdown], { analyze: okAnalysis([F()]), platformFactory: () => p });
+  assert.equal(r.code, 1);
+  assert.match(r.logs, /commit status could not be set/);
+  assert.ok(existsSync(markdown), "reports are written before exiting");
+});
+
+test("analyze of the working tree honours --exclude and the default exclusions", async () => {
+  const repo = makeRepo();
+  mkdirSync(join(repo.dir, "node_modules", "pkg"), { recursive: true });
+  writeFileSync(join(repo.dir, "node_modules", "pkg", "index.js"), "v1\n");
+  git(repo.dir, "add", "-A");
+  git(repo.dir, "commit", "-qm", "dep");
+  writeFileSync(join(repo.dir, "a.js"), "l1\nl2\nLOCAL\nl4\nl5\n");
+  writeFileSync(join(repo.dir, "b.js"), "changed locally\n");
+  writeFileSync(join(repo.dir, "node_modules", "pkg", "index.js"), "v2\n");
+  let seen;
+  const code = await run(["analyze", "--exclude", "b.js", "--out-dir", mkdtempSync(join(tmpdir(), "cra-out-"))], {
+    env: { PATH: process.env.PATH },
+    cwd: repo.dir,
+    log: () => {},
+    out: () => {},
+    analyze: async ({ workspace, diffPath }) => {
+      seen = { workspace, diff: readFileSync(diffPath, "utf8") };
+      return { data: { summary: "s", findings: [] }, error: null, dropped: [] };
+    },
+  });
+  assert.equal(code, 0);
+  assert.equal(seen.workspace, repo.dir, "the working tree is analyzed in place");
+  assert.match(seen.diff, /LOCAL/);
+  assert.doesNotMatch(seen.diff, /b\.js/);
+  assert.doesNotMatch(seen.diff, /node_modules/);
+});
+
+test("the analysis snapshot has no symlinks, lives outside the checkout and is removed", async () => {
+  const repo = makeRepo();
+  const outside = mkdtempSync(join(tmpdir(), "cra-outside-"));
+  writeFileSync(join(outside, "secret.txt"), "leak\n");
+  symlinkSync(join(outside, "secret.txt"), join(repo.dir, "notes.txt"));
+  symlinkSync(outside, join(repo.dir, "hostsdir"));
+  git(repo.dir, "add", "-A");
+  git(repo.dir, "commit", "-qm", "links");
+  const head = git(repo.dir, "rev-parse", "HEAD");
+  const outDir = mkdtempSync(join(tmpdir(), "cra-out-"));
+  let snapshot;
+  const code = await run(["review", "--platform", "none", "--base", repo.base, "--head", head, "--out-dir", outDir, "--markdown", join(outDir, "r.md")], {
+    env: { PATH: process.env.PATH },
+    cwd: repo.dir,
+    log: () => {},
+    out: () => {},
+    analyze: async ({ workspace }) => {
+      snapshot = workspace;
+      assert.equal(existsSync(join(workspace, "notes.txt")), false, "symlink to a file removed");
+      assert.equal(existsSync(join(workspace, "hostsdir")), false, "symlink to a directory removed");
+      return { data: { summary: "s", findings: [] }, error: null, dropped: [] };
+    },
+  });
+  assert.equal(code, 0);
+  assert.equal(snapshot.startsWith(repo.dir + "/"), false, "snapshot lives outside the checkout");
+  assert.equal(existsSync(snapshot), false, "snapshot is removed after the run");
+  assert.match(readFileSync(join(outDir, "r.md"), "utf8"), /2 symlink\(s\) removed from analysis snapshot/);
+});
+
+test("--out-dir . never deletes repository files", async () => {
+  const repo = makeRepo();
+  mkdirSync(join(repo.dir, "src"), { recursive: true });
+  writeFileSync(join(repo.dir, "src", "app.js"), "export const a = 1;\n");
+  git(repo.dir, "add", "-A");
+  git(repo.dir, "commit", "-qm", "src");
+  const head = git(repo.dir, "rev-parse", "HEAD");
+  const code = await run(["review", "--platform", "none", "--base", repo.base, "--head", head, "--out-dir", "."], {
+    env: { PATH: process.env.PATH },
+    cwd: repo.dir,
+    log: () => {},
+    out: () => {},
+    analyze: okAnalysis([]),
+  });
+  assert.equal(code, 0);
+  assert.equal(readFileSync(join(repo.dir, "src", "app.js"), "utf8"), "export const a = 1;\n");
+  assert.ok(existsSync(join(repo.dir, "findings.json")), "out-dir honored");
+});
+
+test("model text cannot inject CI workflow commands into stdout", async () => {
+  const repo = makeRepo();
+  const hostile = [
+    "::set-output name=y::2",
+    "   ::add-mask::secret",
+    "\u00a0::set-env name=W::1",
+    "note ##vso[task.setvariable variable=z]1",
+    "##[group]boom",
+    "\u001b[31mred\u001b[0m",
+  ].join("\r\n");
+  const r = await review(repo, ["--platform", "none"], { analyze: okAnalysis([F({ title: hostile })], hostile) });
+  assert.equal(r.code, 0);
+  // GitHub parses :: after TrimStart (any .NET whitespace); legacy ##[/##vso[
+  // are matched anywhere.
+  assert.doesNotMatch(r.outs, /^[^\S\r\n]*::/m);
+  assert.doesNotMatch(r.outs, /##vso\[/i);
+  assert.doesNotMatch(r.outs, /##\[/);
+  assert.doesNotMatch(r.outs, /\r/);
+  assert.doesNotMatch(r.outs, /\u001b\[31m/);
+  assert.match(r.outs, /\u200b::set-output name=y::2/);
+  assert.match(r.outs, /[ \t]+\u200b::add-mask::secret/);
+  assert.match(r.outs, /note #\u200b#vso\[task\.setvariable/);
+  assert.match(r.outs, /red/);
+});
+
+test("safeConsole defuses command tokens that runners scan for anywhere", () => {
+  const out = safeConsole(
+    "\u001b[1mbold\u001b[0m\r\n  ::set-env name=A::b\nx ##vso[task.complete]y\n##[section]z\n\u0001ctl\u0007",
+  );
+  assert.doesNotMatch(out, /^[^\S\r\n]*::/m);
+  assert.doesNotMatch(out, /##vso\[/i);
+  assert.doesNotMatch(out, /##\[/);
+  assert.doesNotMatch(out, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/);
+  assert.match(out, /^[ \t]+\u200b::set-env/m);
+  assert.equal(safeConsole(undefined), "");
+});
+
+test("safeConsole defuses :: behind every whitespace .NET TrimStart strips", () => {
+  // Char.IsWhiteSpace covers these; a plain [ \t]* guard would let them through.
+  for (const ws of ["\u00a0", "\u1680", "\u2003", "\u202f", "\u3000", "\ufeff", " \t"]) {
+    const out = safeConsole(`ok\n${ws}::add-mask::secret`);
+    assert.doesNotMatch(out, /^[^\S\r\n]*::/m, `bypass with U+${ws.codePointAt(0).toString(16)}`);
+    assert.match(out, /\u200b::add-mask::secret/);
+  }
+  // NEL is whitespace in .NET but not in JS: it must be stripped, not kept.
+  assert.doesNotMatch(safeConsole("a\u0085::set-env name=A::b"), /\u0085/);
+  assert.doesNotMatch(safeConsole("a\u0085::set-env name=A::b"), /^[^\S\r\n]*::/m);
+});
+
+test("safeConsole strips C1 controls, bidi overrides and TeamCity commands", () => {
+  assert.doesNotMatch(safeConsole("a\u009b31m\u009d0"), /[\u0080-\u009f]/);
+  assert.doesNotMatch(safeConsole("\u202etxt\u2066x"), /[\u202a-\u202e\u2066-\u2069]/);
+  assert.doesNotMatch(safeConsole("x ##TeamCity[buildProblem]"), /##teamcity\[/i);
+  // Unterminated OSC must not rescan the rest of the message per ESC.
+  const started = Date.now();
+  safeConsole("\u001b]".repeat(200_000));
+  assert.ok(Date.now() - started < 1000, "no quadratic rescan");
+});
+
+test("an unexpected throw exits 2 with sanitized stderr", () => {
+  const repo = makeRepo();
+  // A file where --out-dir expects a directory: mkdirSync throws, uncaught by run().
+  const blocker = join(repo.dir, "x\n::add-mask::secret");
+  writeFileSync(blocker, "x\n");
+  const res = spawnSync(process.execPath, [
+    fileURLToPath(new URL("../bin/cra.js", import.meta.url)),
+    "review", "--platform", "none", "--base", repo.base, "--head", repo.head, "--out-dir", blocker,
+  ], { cwd: repo.dir, env: { PATH: process.env.PATH }, encoding: "utf8" });
+  assert.equal(res.status, 2);
+  assert.doesNotMatch(res.stderr, /^[^\S\r\n]*::/m);
+  assert.match(res.stderr, /\u200b::add-mask::secret/);
 });

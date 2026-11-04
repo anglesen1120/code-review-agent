@@ -65,7 +65,9 @@ A thread is auto-resolved only when all of these hold:
 - it is **open** (a dev-resolved thread is never touched); and
 - the code **clearly changed**: the platform marks the thread outdated
   (`isOutdated`; GitHub only — GitLab has no such flag) **or** its file changed
-  since the last reviewed commit.
+  since the last reviewed commit; and
+- the thread's file was **actually reviewed**: files skipped by the diff budget
+  are not evidence of a fix, so their threads stay open.
 
 "Changed since the last reviewed commit" is computed from the reviewed-SHA
 marker (`<!-- code-review-agent:reviewed-sha=<sha> -->`) in the summary comment:
@@ -125,6 +127,9 @@ merge-gate note, so a reviewer is never told "all clear" when threads remain.
 | No thread could be posted at all | Run fails with a clear token-permissions message (misconfiguration is visible). |
 | Resolve fails (token cannot resolve) | Logged; thread stays open; summary count is honest. |
 | Summary comment fails | Logged; threads are unaffected; run succeeds. |
-| Analysis produces invalid JSON | Retry once; then nothing is posted or resolved, the summary records the failure, and `--fail-on` (anything but `none`) exits 1. |
+| Commit status cannot be set (`--set-status`) | Logged; report files are still written; run exits 1. |
+| Analysis fails (non-zero opencode exit, signal, or invalid JSON) | Retry once; then nothing is posted or resolved, the previous reviewed-SHA marker is kept, the summary records the failure, and `--fail-on` (anything but `none`) exits 1. |
+| File skipped by the diff budget | Listed in the summary notes; its threads stay open, never auto-resolved. |
+| Whole diff over budget | Nothing posted or resolved; summary says the diff was not reviewed; exit 1 regardless of `--fail-on`. |
 | Nothing could be posted at all | Exit 1 even with `--fail-on none`, so a misconfigured token is visible. |
 | Finding outside a diff hunk | Summary only; Critical/Warning still count for `--fail-on`. |

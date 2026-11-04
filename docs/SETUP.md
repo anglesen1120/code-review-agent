@@ -127,6 +127,13 @@ branch:
 
 The precise rules are in [`THREAD-LIFECYCLE.md`](THREAD-LIFECYCLE.md).
 
+The review is **advisory**: an injected PR can make the model report nothing, so
+keep human review and deterministic scanners as the real gate. Two delivery
+details matter operationally: with `set-status`, a failed status API call exits
+`1` after the reports are written; and files skipped by `max-diff-bytes` keep
+their threads open (a fully over-budget diff is reported as not reviewed and
+exits `1` regardless of `fail-on`).
+
 ## Inputs reference
 
 | Input | Required | Default | Description |

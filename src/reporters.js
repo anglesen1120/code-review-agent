@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { normalizeTitle, sanitize } from "./lifecycle.js";
+import { codeSpan, inlineText, normalizeTitle, sanitize } from "./lifecycle.js";
 
 const SEVERITIES = ["Critical", "Warning", "Info"];
 const SARIF_LEVEL = { Critical: "error", Warning: "warning", Info: "note" };
@@ -22,15 +22,6 @@ const endOf = (f) => Math.max(startOf(f), f.endLine ?? startOf(f));
 // artifactLocation.uri is a URI: '#' would start a fragment, so encode each
 // path segment and keep '/' as the separator.
 const artifactUri = (file) => String(file).split("/").map(encodeURIComponent).join("/");
-
-// Markdown inline code that a filename cannot break out of (backticks, newlines).
-const codeSpan = (text) => {
-  const s = String(text).replace(/[\r\n\t]+/g, " ").replace(/<!--/g, "&lt;!--");
-  const longest = (s.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0);
-  const fence = "`".repeat(longest + 1);
-  const pad = s.startsWith("`") || s.endsWith("`") ? " " : "";
-  return `${fence}${pad}${s}${pad}${fence}`;
-};
 
 const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
 
@@ -111,9 +102,9 @@ export function toMarkdownReport({ summary, findings = [], notes = [] }) {
     group.forEach((f, i) => {
       lines.push(
         "",
-        `#### ${i + 1}. ${codeSpan(`${f.file}:${f.line}`)} — ${sanitize(f.title)}`,
+        `#### ${i + 1}. ${codeSpan(`${f.file}:${f.line}`)} — ${inlineText(f.title)}`,
         "",
-        `**${f.category}**`,
+        `**${inlineText(f.category)}**`,
         "",
         sanitize(f.description),
       );

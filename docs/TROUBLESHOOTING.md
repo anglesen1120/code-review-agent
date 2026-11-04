@@ -11,7 +11,7 @@ posting failures.
 | Exit | Likely cause |
 | --- | --- |
 | `0` | Review completed; `--fail-on` did not match (or is `none`). |
-| `1` | Open issue matched `--fail-on`, the analysis failed while `--fail-on` is set, no thread could be posted at all, or existing threads could not be read. |
+| `1` | Open issue matched `--fail-on`; the analysis failed while `--fail-on` is set; no thread could be posted at all; existing threads could not be read; the commit status could not be set with `--set-status`; or the whole diff exceeded `--max-diff-bytes` and nothing was reviewed. |
 | `2` | Usage/configuration: unknown flag value, no base revision, missing platform token or MR/PR context, unreadable event payload. |
 
 ## `Unable to resolve action anglesen1120/code-review-agent`
@@ -69,7 +69,10 @@ access for fine-grained tokens.
 
 The analyzer retries once, then returns an error. **Nothing is posted and
 nothing is resolved**: existing threads keep blocking merge, the summary records
-the failure, and `--fail-on` (anything but `none`) exits `1`. Common causes:
+the failure, the reviewed-SHA marker keeps its previous value (or is omitted),
+and `--fail-on` (anything but `none`) exits `1`. An opencode process that exits
+non-zero or is killed counts as a failed attempt even when it printed valid JSON.
+Common causes:
 
 - **Wrong or retired model.** The log shows `provider error: 400 … Model is
   unavailable`. Providers retire model ids (OpenCode Go dropped
@@ -92,8 +95,23 @@ the failure, and `--fail-on` (anything but `none`) exits `1`. Common causes:
 The extractor tried the whole output, fenced blocks and balanced `{…}` spans,
 then retried with a stricter instruction. If both attempts failed, the model is
 not honouring the schema. Try a stronger model (`--model`), or inspect
-`events.jsonl` / `opencode.err` in the scratch dir (`.cra` on GitLab,
-`$RUNNER_TEMP/cra` on GitHub, `.review` for `analyze`).
+`events.jsonl` / `opencode.err` in the scratch dir (`.review` for `analyze`,
+`.cra` on GitLab, `$RUNNER_TEMP/cra` when set, otherwise a private
+`cra-*` directory under the system temp dir — pass `--out-dir` to choose a
+known path). These files are not redacted, so treat them as sensitive.
+
+## `symlink(s) removed from analysis snapshot`
+
+`git archive` preserves committed symlinks, and a symlink can point outside the
+snapshot (`~/secret`, `/etc`, the checkout). The CLI removes every symlink after
+extracting and reports the count in the summary notes. If a finding depends on
+following a committed symlink, the model cannot see that target — check the
+target file directly.
+
+The snapshot itself is a private directory outside the checkout with its own
+`git init`, deleted at the end of the run. It is not `<out-dir>/src`; scratch
+files (`pr.diff`, `findings.json`, `existing_threads.json`, `result.json`,
+`opencode.json`, `events.jsonl`, `opencode.err`) stay in the out-dir.
 
 ## No threads at all, but the summary exists
 
@@ -155,8 +173,18 @@ uid Jenkins uses.
 Azure container jobs expect an image **without** `ENTRYPOINT` and run steps with
 `docker exec`. The template clears it with `options: '--entrypoint=""'` and runs
 as root (`-u 0`) so the SARIF/Markdown files land in the agent-owned workspace
-mount. If your policy forbids root containers, publish to a path the image user
-owns and chown the staging directory first.
+mount. On a self-hosted pool you can run as the uid that owns the clone instead
+(`-u 1000`); if your policy forbids root containers, publish to a path the image
+user owns and chown the staging directory first.
+
+## Azure: private repository — `git fetch` fails or needs a token
+
+`persistCredentials: false` removes the job token from `.git/config`, so a later
+`git fetch` cannot authenticate. The template avoids that entirely:
+`fetchDepth: 0` fetches the full history and `origin/<target>` is already there,
+so the review needs no remote access. Do not add
+`http.extraheader`/`System.AccessToken` to the `cra` step — the reviewer only
+needs `CRA_API_KEY`.
 
 ## Bitbucket: permission denied writing `cra-report.md`
 
@@ -169,6 +197,19 @@ owns the workspace.
 The summary `Notes` section lists every file skipped by the diff budget
 (`--max-diff-bytes`, default 250000 bytes). Raise the budget, or exclude more
 paths with `--exclude`/`CRA_EXCLUDE`. Skipping is reported, never silent.
+
+Threads on skipped files are **kept open**: an unreviewed file is not evidence
+that an issue was fixed. If the whole diff is over budget, nothing is posted or
+resolved, the summary says `Diff over <N> bytes: not reviewed.`, the
+reviewed-SHA marker does not advance, and the run exits `1` regardless of
+`--fail-on` — there is no evidence to gate on.
+
+## `cra: commit status could not be set.`
+
+`--set-status` was requested and the status API call failed (missing
+`statuses: write`, protected branch, or a transient platform error). Report files
+and the summary are still written, then the run exits `1`, because a required
+delivery step failed. Fix the token permission or drop `--set-status`.
 
 ## Summary count says threads remain but I resolved them
 

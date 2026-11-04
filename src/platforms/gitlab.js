@@ -11,6 +11,24 @@ export function detectGitLab(env = process.env) {
   return env.GITLAB_CI === "true";
 }
 
+/**
+ * Percent-encode a repo-relative path segment by segment so a file name cannot
+ * escape the blob path or break a Markdown link (`#`, `?`, spaces, parentheses).
+ */
+function encodePath(file) {
+  const raw = typeof String.prototype.toWellFormed === "function"
+    ? String(file ?? "").toWellFormed()
+    : String(file ?? "");
+  return raw
+    .replace(/\\/g, "/")
+    .replace(/^(?:\.\/)+/, "")
+    .split("/")
+    .map((segment) =>
+      encodeURIComponent(segment).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`),
+    )
+    .join("/");
+}
+
 export function createGitLabPlatform({ env = process.env, fetchImpl = globalThis.fetch, log = console.error } = {}) {
   const token = env.GITLAB_TOKEN || env.CRA_GITLAB_TOKEN;
   if (!token) {
@@ -37,6 +55,7 @@ export function createGitLabPlatform({ env = process.env, fetchImpl = globalThis
     if (!value) throw new Error(`GitLab review requires ${name}.`);
   }
   const apiUrl = (env.CI_API_V4_URL || "https://gitlab.com/api/v4").replace(/\/+$/, "");
+  const serverUrl = env.CI_PROJECT_URL.replace(/\/+$/, "");
   const projectPath = `/projects/${encodeURIComponent(env.CI_PROJECT_ID)}`;
   const mrPath = `${projectPath}/merge_requests/${encodeURIComponent(context.prNumber)}`;
   const redact = (value) => String(value).replaceAll(token, "[REDACTED]");
@@ -51,6 +70,9 @@ export function createGitLabPlatform({ env = process.env, fetchImpl = globalThis
           method,
           headers: { "PRIVATE-TOKEN": token, Accept: "application/json", ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          // Never follow a redirect: the PRIVATE-TOKEN header must only reach
+          // the configured API host. A 3xx is a hard error, not a retry.
+          redirect: "manual",
         });
         // Read the body inside the retry boundary: a connection drop after the
         // headers still rejects here and must be retried/redacted like any
@@ -61,6 +83,13 @@ export function createGitLabPlatform({ env = process.env, fetchImpl = globalThis
         log(`GitLab ${method} ${path}: retrying network error (${attempt + 1}/3)`);
         await sleep(250 * 2 ** attempt);
         continue;
+      }
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        const where = location
+          ? ` to ${redact(String(location).replace(/[\u0000-\u001f\u007f]+/g, " "))}`
+          : "";
+        throw new Error(`${method} ${path}: ${response.status} unexpected redirect${where}`);
       }
       let data;
       try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -96,6 +125,7 @@ export function createGitLabPlatform({ env = process.env, fetchImpl = globalThis
 
   let userPromise;
   let refsPromise;
+  let positionRefs;
   let summaryId;
   const getUser = () => userPromise ??= request("GET", "/user").then(({ data }) => {
     if (data?.id == null) throw new Error("GET /user: GitLab response is missing the bot user id");
@@ -106,6 +136,32 @@ export function createGitLabPlatform({ env = process.env, fetchImpl = globalThis
     if (!refs?.base_sha || !refs.start_sha || !refs.head_sha) throw new Error(`GET ${mrPath}: GitLab response is missing diff_refs`);
     return refs;
   });
+
+  /**
+   * Diff refs for the reviewed head. `context.headSha` is read here, not when
+   * the adapter is created: the CLI rewrites it to the SHA it actually
+   * reviewed. The MR's `diff_refs` may already point at a newer head, in which
+   * case the matching MR version supplies base/start/head for that SHA.
+   * Throws when no version matches, so nothing is posted under the wrong refs.
+   */
+  async function getPositionRefs() {
+    const headSha = context.headSha;
+    if (positionRefs?.headSha === headSha) return positionRefs.refs;
+    const current = await getRefs();
+    let refs = current;
+    if (headSha !== current.head_sha) {
+      const versions = await list(`${mrPath}/versions`);
+      const match = versions.find((version) => version?.head_commit_sha === headSha);
+      if (!match?.base_commit_sha || !match.start_commit_sha || !match.head_commit_sha) {
+        throw new Error(
+          `no MR version has head_commit_sha ${headSha} (MR diff_refs head is ${current.head_sha}); refusing to post discussions under the wrong diff refs`,
+        );
+      }
+      refs = { base_sha: match.base_commit_sha, start_sha: match.start_commit_sha, head_sha: match.head_commit_sha };
+    }
+    positionRefs = { headSha, refs };
+    return refs;
+  }
 
   async function loadSummary(user) {
     const notes = await list(`${mrPath}/notes?sort=desc`);
@@ -144,9 +200,19 @@ export function createGitLabPlatform({ env = process.env, fetchImpl = globalThis
     async postThreads(items) {
       const posted = [];
       const failed = [];
+      if (!items?.length) return { posted, failed, reviewId: null };
+      let refs;
+      try {
+        // Resolve once up front: if the reviewed head has no MR version, every
+        // finding fails with that reason and no discussion is created.
+        refs = await getPositionRefs();
+      } catch (error) {
+        const reason = redact(error.message ?? error);
+        for (const { finding } of items) failed.push({ finding, error: reason });
+        return { posted, failed, reviewId: null };
+      }
       for (const { finding, anchor } of items) {
         try {
-          const refs = await getRefs();
           await request("POST", `${mrPath}/discussions`, {
             body: markdownThread(finding),
             position: {
@@ -187,7 +253,8 @@ export function createGitLabPlatform({ env = process.env, fetchImpl = globalThis
       });
     },
     fileUrl(file, line) {
-      return `${env.CI_PROJECT_URL.replace(/\/+$/, "")}/-/blob/${context.headSha}/${encodeURI(file)}#L${line}`;
+      const anchor = Number.isInteger(line) && line > 0 ? `#L${line}` : "";
+      return `${serverUrl}/-/blob/${context.headSha}/${encodePath(file)}${anchor}`;
     },
   };
 }

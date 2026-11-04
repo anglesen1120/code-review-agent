@@ -6,6 +6,10 @@
 pipeline {
   agent {
     docker {
+      // Pin the image in real use: a version tag or a digest is reproducible,
+      // while `:latest` is mutable.
+      //   image 'ghcr.io/anglesen1120/code-review-agent:0.1.0'
+      //   image 'ghcr.io/anglesen1120/code-review-agent@sha256:<digest>'
       image 'ghcr.io/anglesen1120/code-review-agent:latest'
       // The image entrypoint is `cra`; Jenkins starts the container with its
       // own command, so reset the entrypoint. HOME must be writable for the

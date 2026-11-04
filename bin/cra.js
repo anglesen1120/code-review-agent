@@ -8,15 +8,17 @@
 //
 // Exit codes: 0 ok · 1 gate failed (--fail-on) or nothing could be delivered ·
 // 2 usage/configuration error.
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { DEFAULT_BASE_URL, DEFAULT_MODEL, ROOT, runAnalysis } from "../src/analyzer.js";
-import { capDiff, changedFilesBetween, gitDiff, parseUnifiedDiff, snapshotTree } from "../src/diff.js";
-import { computeDelta, gateFails, markdownSummary } from "../src/lifecycle.js";
+import {
+  assertRevision, capDiff, changedFilesBetween, gitDiff, parseUnifiedDiff, snapshotTree, workingTreeDiff,
+} from "../src/diff.js";
+import { computeDelta, gateFails, markdownSummary, matchThread, rank } from "../src/lifecycle.js";
 import { createPlatform, inferBaseRef, PLATFORMS } from "../src/platforms/index.js";
 import { toCodeQuality, toMarkdownReport, toSarif } from "../src/reporters.js";
 
@@ -97,7 +99,10 @@ export function resolveOptions(argv, env) {
 }
 
 function git(args, cwd) {
-  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  // A working-tree or range diff can exceed Node's 1 MiB default.
+  return execFileSync("git", args, {
+    cwd, encoding: "utf8", maxBuffer: 128 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
 }
 
 function hasCommit(ref, cwd) {
@@ -125,14 +130,61 @@ function defaultOutDir(env, cwd, command) {
   if (command === "analyze") return join(cwd, ".review");
   if (env.RUNNER_TEMP) return join(env.RUNNER_TEMP, "cra");
   if (env.GITLAB_CI === "true") return join(cwd, ".cra"); // artifacts must live in the project dir
-  return join(tmpdir(), `cra-${process.pid}`);
+  // Unpredictable 0700 scratch dir: a shared /tmp/cra-<pid> could be pre-created
+  // by another local user. The analysis snapshot never lives here (see run()).
+  return mkdtempSync(join(tmpdir(), "cra-"));
 }
 
 const writeOut = (path, content) => writeFileSync(path, typeof content === "string" ? content : JSON.stringify(content, null, 2));
 
 function setGitHubOutput(env, values) {
   if (!env.GITHUB_OUTPUT) return;
-  appendFileSync(env.GITHUB_OUTPUT, Object.entries(values).map(([k, v]) => `${k}=${v}\n`).join(""));
+  // One key=value per line: a newline inside a value (API-provided review id)
+  // would forge an extra output.
+  const line = ([k, v]) => `${k}=${String(v ?? "").replace(/[\r\n]+/g, " ")}\n`;
+  appendFileSync(env.GITHUB_OUTPUT, Object.entries(values).map(line).join(""));
+}
+
+// Model output and PR text reach stdout/stderr verbatim, and CI runners parse
+// those streams for commands. GitHub's ::commands are matched after TrimStart
+// (.NET Char.IsWhiteSpace), while GitHub's legacy ##[ and Azure's ##vso[/##
+// teamcity[ are matched ANYWHERE in the message (IndexOf), so a line prefix
+// alone does not stop them: the token itself must be broken. Strip ANSI, C0/C1
+// control characters and bidi overrides first, so no control char can be used
+// to re-assemble a token, then defuse every command token.
+const ANSI_ESCAPE = /\u001b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[@-Z\\-_])/g;
+// Keeps \n and \t; drops \r, C0, DEL, C1 (incl. NEL) and bidi overrides.
+const CONTROL_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
+// Whitespace inside one line as .NET's TrimStart sees it (U+0085 is already
+// stripped above; \u2028/\u2029 end a line for the `m` flag, so they stay out).
+const LINE_LEADING_SPACE = /^([^\S\r\n\u2028\u2029]*)(?=::)/gm;
+
+export function safeConsole(text) {
+  return String(text ?? "")
+    .replace(ANSI_ESCAPE, "")
+    .replace(CONTROL_CHARS, "")
+    .replace(LINE_LEADING_SPACE, "$1\u200b") // GitHub: TrimStart + startsWith("::")
+    .replace(/#(#(?:vso|teamcity)\[|\[)/gi, "#\u200b$1"); // IndexOf-scanned tokens
+}
+
+/**
+ * Severities of the items still open after this run. A finding that re-reports
+ * an existing thread wins when it is more severe: the gate must reflect the
+ * code as reviewed now, not the severity the thread was created with.
+ */
+function openSeveritiesFrom(openThreads, findings, allThreads) {
+  const current = new Map();
+  for (const f of findings) {
+    if (f.severity !== "Critical" && f.severity !== "Warning") continue;
+    const t = matchThread(f, allThreads);
+    if (!t) continue;
+    if (rank[f.severity] > (rank[current.get(t)] ?? 0)) current.set(t, f.severity);
+  }
+  return openThreads.map((t) => {
+    const previous = t.severity ?? "Warning";
+    const now = current.get(t);
+    return now && rank[now] > rank[previous] ? now : previous;
+  });
 }
 
 /**
@@ -140,31 +192,38 @@ function setGitHubOutput(env, values) {
  * @returns {Promise<number>} exit code
  */
 export async function run(argv, { env = process.env, cwd = process.cwd(), log = console.error, out = console.log, analyze = runAnalysis, platformFactory = createPlatform } = {}) {
+  // Everything printed may carry model or PR text: neutralize CI command syntax.
+  const warn = (message) => log(safeConsole(message));
+  const say = (message) => out(safeConsole(message));
   let opts;
   try {
     opts = resolveOptions(argv, env);
   } catch (e) {
-    log(`cra: ${e.message}\n\n${USAGE}`);
+    warn(`cra: ${e.message}\n\n${USAGE}`);
     return 2;
   }
   if (opts.help) {
-    out(USAGE);
+    say(USAGE);
     return 0;
   }
   if (opts.version) {
-    out(VERSION);
+    say(VERSION);
     return 0;
   }
 
   let platform;
   try {
-    platform = platformFactory(opts.platform, { env, log });
+    platform = platformFactory(opts.platform, { env, log: warn });
   } catch (e) {
-    log(`cra: ${e.message}`);
+    warn(`cra: ${e.message}`);
     return 2;
   }
   const workspace = resolve(platform?.context.workspace || cwd);
-  const outDir = resolve(opts.outDir ?? defaultOutDir(env, workspace, opts.command));
+  // A user-supplied --out-dir is relative to where `cra` was invoked, not to the
+  // platform workspace.
+  const outDir = opts.outDir
+    ? resolve(cwd, opts.outDir)
+    : resolve(defaultOutDir(env, workspace, opts.command));
   mkdirSync(outDir, { recursive: true });
 
   // ---- 1. diff range ------------------------------------------------------
@@ -174,48 +233,65 @@ export async function run(argv, { env = process.env, cwd = process.cwd(), log = 
   let diff;
   let changedFiles;
   try {
+    // Validate before ANY git call: a revision starting with "-" is argv injection.
+    if (base) assertRevision("base", base);
+    assertRevision("head", head);
     if (workingTree) {
       base = "HEAD";
-      diff = git(["diff", "--no-color", "-U5", "HEAD", "--"], workspace) + "\n";
-      changedFiles = git(["diff", "--name-only", "HEAD", "--"], workspace).split("\n").filter(Boolean);
+      ({ diff, changedFiles } = workingTreeDiff({ cwd: workspace, excludes: opts.exclude }));
+      diff += "\n";
       head = "WORKTREE";
     } else {
       if (!base) {
         throw new UsageError("no base revision: pass --base (or CRA_BASE), or run in a PR/MR pipeline");
       }
-      ensureCommits([base, head], workspace, log);
+      ensureCommits([base, head], workspace, warn);
       ({ diff, changedFiles } = gitDiff({ base, head, excludes: opts.exclude, cwd: workspace }));
     }
   } catch (e) {
-    log(`cra: ${e.message}`);
+    warn(`cra: ${e.message}`);
     return 2;
   }
-  const headSha = head === "WORKTREE" ? head : git(["rev-parse", head], workspace);
+  let headSha;
+  try {
+    headSha = head === "WORKTREE" ? head : git(["rev-parse", head], workspace);
+  } catch (e) {
+    warn(`cra: cannot resolve ${head}: ${e.stderr || e.message}`);
+    return 2;
+  }
   // Threads/statuses must anchor to the commit actually reviewed.
   if (platform) platform.context.headSha = headSha;
   const capped = capDiff(diff, opts.maxDiffBytes);
   const diffPath = join(outDir, "pr.diff");
   writeOut(diffPath, capped.text);
-  const diffIndex = parseUnifiedDiff(diff);
+  // Only the budgeted text is reviewed, so only it may anchor a finding.
+  const diffIndex = parseUnifiedDiff(capped.text);
   const notes = [];
+  const skippedFiles = new Set(capped.skipped);
+  const wholeDiffSkipped = skippedFiles.size > 0 && !capped.text.trim();
   if (capped.skipped.length > 0) {
     notes.push(`Diff over ${opts.maxDiffBytes} bytes: not reviewed — ${capped.skipped.join(", ")}`);
   }
 
   // ---- 2. existing threads -------------------------------------------------
   let threads = [];
-  let changedSince = changedFiles;
+  let lastReviewedSha = null;
+  // Files the budget skipped were not reviewed, so a change in them is no
+  // evidence that their thread is fixed: they never feed resolution.
+  let changedSince = changedFiles.filter((p) => !skippedFiles.has(p));
   if (platform) {
     try {
       const state = await platform.fetchState();
       threads = state.threads;
-      if (state.lastReviewedSha && state.lastReviewedSha !== headSha) {
-        changedSince = changedFilesBetween({ from: state.lastReviewedSha, to: headSha, cwd: workspace }) ?? changedFiles;
-      } else if (state.lastReviewedSha === headSha) {
+      lastReviewedSha = state.lastReviewedSha ?? null;
+      if (lastReviewedSha && lastReviewedSha !== headSha) {
+        changedSince = (changedFilesBetween({ from: lastReviewedSha, to: headSha, cwd: workspace }) ?? changedFiles)
+          .filter((p) => !skippedFiles.has(p));
+      } else if (lastReviewedSha === headSha) {
         changedSince = []; // re-run on the same commit: nothing changed under any thread
       }
     } catch (e) {
-      log(`cra: cannot read existing review threads: ${e.message}`);
+      warn(`cra: cannot read existing review threads: ${e.message}`);
       return 1;
     }
     writeOut(
@@ -226,39 +302,55 @@ export async function run(argv, { env = process.env, cwd = process.cwd(), log = 
 
   // ---- 3. analysis ---------------------------------------------------------
   let analysis;
-  if (!capped.text.trim()) {
-    analysis = { data: { summary: "No code changes to review.", findings: [] }, error: null, dropped: [] };
-  } else {
-    // Committed revisions: analyze a clean export (no .git, no untracked files),
-    // so injected instructions cannot reach credentials in the checkout.
-    let analysisRoot = workspace;
-    if (!workingTree) {
-      try {
-        analysisRoot = snapshotTree({ rev: headSha, cwd: workspace, dest: join(outDir, "src") });
-      } catch (e) {
-        log(`cra: cannot export ${headSha} for analysis: ${e.message}`);
-        return 2;
+  let snapshotDir = null;
+  try {
+    if (wholeDiffSkipped) {
+      analysis = { data: { summary: `Diff over ${opts.maxDiffBytes} bytes: not reviewed.`, findings: [] }, error: null, dropped: [] };
+    } else if (!capped.text.trim()) {
+      analysis = { data: { summary: "No code changes to review.", findings: [] }, error: null, dropped: [] };
+    } else {
+      // Committed revisions: analyze a private export (no .git history, no
+      // untracked files, no symlinks), so injected instructions cannot reach
+      // credentials in the checkout.
+      let analysisRoot = workspace;
+      if (!workingTree) {
+        try {
+          snapshotDir = mkdtempSync(join(tmpdir(), "cra-snap-"));
+          const snapshot = snapshotTree({ rev: headSha, cwd: workspace, dest: snapshotDir });
+          analysisRoot = snapshot.dir;
+          if (snapshot.symlinksRemoved > 0) {
+            notes.push(`${snapshot.symlinksRemoved} symlink(s) removed from analysis snapshot`);
+          }
+        } catch (e) {
+          warn(`cra: cannot export ${headSha} for analysis: ${e.message}`);
+          return 2;
+        }
       }
+      analysis = await analyze({
+        scratchDir: outDir,
+        diffPath,
+        workspace: analysisRoot,
+        prNumber: platform?.context.prNumber,
+        baseSha: base,
+        headSha,
+        model: opts.model,
+        baseUrl: opts.baseUrl,
+        apiKey: opts.apiKey,
+        env,
+        log: warn,
+      });
     }
-    analysis = await analyze({
-      scratchDir: outDir,
-      diffPath,
-      workspace: analysisRoot,
-      prNumber: platform?.context.prNumber,
-      baseSha: base,
-      headSha,
-      model: opts.model,
-      baseUrl: opts.baseUrl,
-      apiKey: opts.apiKey,
-      env,
-      log,
-    });
+  } finally {
+    // The snapshot is a private copy of the tree; drop it as soon as the model
+    // has read it (also when analyze() throws).
+    if (snapshotDir) rmSync(snapshotDir, { recursive: true, force: true });
   }
   const analysisFailed = Boolean(analysis.error);
+  const notReviewed = wholeDiffSkipped;
   const data = analysis.data ?? { summary: `Analysis failed: ${analysis.error}`, findings: [] };
   for (const d of analysis.dropped ?? []) notes.push(`Dropped: ${d}`);
   if (analysisFailed) {
-    log(`cra: ${analysis.error}`);
+    warn(`cra: ${analysis.error}`);
     notes.push("Analysis failed — existing threads were left untouched. See the CI job log.");
   }
 
@@ -280,23 +372,30 @@ export async function run(argv, { env = process.env, cwd = process.cwd(), log = 
   let unresolvedCount;
   let reviewId = null;
   let deliveryFailed = false;
+  let statusFailed = false;
+  // Threads on files the budget skipped were not reviewed: never resolve them.
+  const reviewThreads = threads.filter((t) => !skippedFiles.has(t.path));
   if (platform) {
-    // A failed analysis carries no evidence that anything was fixed: never
-    // resolve, never post. Old threads keep blocking the merge.
-    const delta = analysisFailed
+    // A failed analysis (or an entirely over-budget diff) carries no evidence
+    // that anything was fixed: never resolve, never post. Old threads keep
+    // blocking the merge.
+    const noEvidence = analysisFailed || notReviewed;
+    const delta = noEvidence
       ? { toPost: [], toResolve: [], kept: threads.filter((t) => !t.isResolved) }
-      : computeDelta(anchored.map((a) => a.finding), threads, changedSince);
+      : computeDelta(anchored.map((a) => a.finding), reviewThreads, changedSince);
     const anchorOf = new Map(anchored.map((a) => [a.finding, a.anchor]));
 
     if (opts.dryRun) {
-      out(JSON.stringify({
+      say(JSON.stringify({
         post: delta.toPost.map((f) => `${f.severity} ${f.file}:${f.line} ${f.title}`),
         resolve: delta.toResolve.map((t) => `${t.path}:${t.line} ${t.title}`),
         keep: delta.kept.map((t) => `${t.path}:${t.line} ${t.title}`),
       }, null, 2));
-      openSeverities = [...delta.kept, ...threads.filter((t) => !t.isResolved && !delta.toResolve.includes(t) && !delta.kept.includes(t))]
-        .map((t) => t.severity ?? "Warning").concat(delta.toPost.map((f) => f.severity));
-      unresolvedCount = openSeverities.length;
+      const plannedResolved = new Set(delta.toResolve.map((t) => t.id));
+      const stillOpen = threads.filter((t) => !t.isResolved && !plannedResolved.has(t.id));
+      openSeverities = openSeveritiesFrom(stillOpen, data.findings, threads)
+        .concat(delta.toPost.map((f) => f.severity), unanchored.map((f) => f.severity));
+      unresolvedCount = stillOpen.length + delta.toPost.length;
     } else {
       let posted = [];
       let failed = [];
@@ -307,7 +406,7 @@ export async function run(argv, { env = process.env, cwd = process.cwd(), log = 
           failed = delta.toPost.map((f) => ({ finding: f, error: e.message }));
         }
         for (const { finding, error } of failed) {
-          log(`cra: could not post ${finding.file}:${finding.line}: ${error}`);
+          warn(`cra: could not post ${finding.file}:${finding.line}: ${error}`);
           notes.push(`Could not post inline: ${finding.severity} — ${finding.title} (${finding.file}:${finding.line})`);
         }
       }
@@ -317,52 +416,61 @@ export async function run(argv, { env = process.env, cwd = process.cwd(), log = 
           await platform.resolveThread(t);
           resolvedIds.add(t.id);
         } catch (e) {
-          log(`cra: could not resolve thread ${t.id}: ${e.message}`);
+          warn(`cra: could not resolve thread ${t.id}: ${e.message}`);
         }
       }
       if (delta.toResolve.length > resolvedIds.size) {
         notes.push(`${delta.toResolve.length - resolvedIds.size} fixed thread(s) could not be auto-resolved (token permissions?).`);
       }
-      // Honest gate: count real outcomes, not the plan.
+      // Honest gate: count real outcomes, not the plan, and let the severity of
+      // the finding that re-reports a thread (an escalation) win.
       const stillOpen = threads.filter((t) => !t.isResolved && !resolvedIds.has(t.id));
-      openSeverities = stillOpen.map((t) => t.severity ?? "Warning")
-        .concat(posted.map((f) => f.severity), failed.map((x) => x.finding.severity));
+      openSeverities = openSeveritiesFrom(stillOpen, data.findings, threads)
+        .concat(posted.map((f) => f.severity), failed.map((x) => x.finding.severity),
+          unanchored.map((f) => f.severity));
       unresolvedCount = stillOpen.length + posted.length;
       deliveryFailed = delta.toPost.length > 0 && posted.length === 0;
 
-      const summary = markdownSummary({
+      // A failed or over-budget run has no new evidence: keep the previous
+      // reviewed-sha marker (or none), never advance it.
+      const markerSha = noEvidence ? lastReviewedSha : headSha;
+      let summary = markdownSummary({
         summary: data.summary,
         findings: data.findings,
-        headSha,
+        headSha: markerSha ?? headSha,
         prNumber: platform.context.prNumber,
         unresolvedCount,
         fileUrl: (file, line) => platform.fileUrl(file, line),
         notes,
         prLabel: platform.prLabel,
       });
+      if (noEvidence && !markerSha) {
+        summary = summary.replace(/<!-- code-review-agent:reviewed-sha=[^\n]*? -->\n?/, "");
+      }
       try {
         await platform.upsertSummary(summary);
       } catch (e) {
         // Informational; the threads are the merge gate.
-        log(`cra: could not create/update the summary comment (threads unaffected): ${e.message}`);
+        warn(`cra: could not create/update the summary comment (threads unaffected): ${e.message}`);
       }
       if (opts.setStatus) {
-        const failing = analysisFailed || gateFails(openSeverities, opts.failOn === "none" ? "warning" : opts.failOn);
+        const failing = noEvidence || gateFails(openSeverities, opts.failOn === "none" ? "warning" : opts.failOn);
+        const description = analysisFailed
+          ? "Analysis failed; previous review threads still apply."
+          : notReviewed ? "Diff over budget: not reviewed." : `${unresolvedCount} unresolved review thread(s).`;
         try {
-          await platform.setStatus(failing ? "failure" : "success",
-            analysisFailed ? "Analysis failed; previous review threads still apply." : `${unresolvedCount} unresolved review thread(s).`);
+          await platform.setStatus(failing ? "failure" : "success", description);
         } catch (e) {
-          log(`cra: could not set commit status: ${e.message}`);
+          warn(`cra: could not set commit status: ${e.message}`);
+          statusFailed = true;
         }
       }
-      log(`cra: posted ${posted.length}, resolved ${resolvedIds.size}, unresolved ${unresolvedCount}`);
+      warn(`cra: posted ${posted.length}, resolved ${resolvedIds.size}, unresolved ${unresolvedCount}`);
     }
   } else {
     openSeverities = data.findings.map((f) => f.severity);
     unresolvedCount = data.findings.filter((f) => f.severity !== "Info").length;
   }
-  // Unanchored Critical/Warning findings still count for the exit-code gate.
-  if (platform) openSeverities = openSeverities.concat(unanchored.map((f) => f.severity));
 
   // ---- 5. reports + outputs -------------------------------------------------
   const report = toMarkdownReport({ summary: data.summary, findings: data.findings, notes });
@@ -385,14 +493,22 @@ export async function run(argv, { env = process.env, cwd = process.cwd(), log = 
     "review-id": reviewId ?? "",
     "analysis-failed": analysisFailed,
   });
-  if (!platform) out(report);
+  if (!platform) say(report);
 
+  if (statusFailed) {
+    warn("cra: commit status could not be set.");
+    return 1;
+  }
   if (deliveryFailed) {
-    log("cra: no review thread could be posted — check the token's write permissions.");
+    warn("cra: no review thread could be posted — check the token's write permissions.");
+    return 1;
+  }
+  if (notReviewed) {
+    warn("cra: diff exceeds --max-diff-bytes; nothing was reviewed.");
     return 1;
   }
   if (opts.failOn !== "none" && (analysisFailed || gateFails(openSeverities, opts.failOn))) {
-    log(analysisFailed ? "cra: failing closed — analysis failed." : `cra: gate failed (--fail-on ${opts.failOn}).`);
+    warn(analysisFailed ? "cra: failing closed — analysis failed." : `cra: gate failed (--fail-on ${opts.failOn}).`);
     return 1;
   }
   return 0;
@@ -407,5 +523,12 @@ const isMain = (() => {
   }
 })();
 if (isMain) {
-  process.exitCode = await run(process.argv.slice(2));
+  try {
+    process.exitCode = await run(process.argv.slice(2));
+  } catch (e) {
+    // An unexpected throw must not dump raw text (paths, git stderr, model
+    // output) onto the runner's log without the command-token defense.
+    console.error(safeConsole(e?.stack ?? String(e)));
+    process.exitCode = 2;
+  }
 }

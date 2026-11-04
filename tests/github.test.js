@@ -56,7 +56,7 @@ function mockFetch(handler) {
   return fetchImpl;
 }
 
-function makePlatform(handler, { env = {}, sleep, retryBaseMs } = {}) {
+function makePlatform(handler, { env = {}, sleep, retryBaseMs, now } = {}) {
   const fetchImpl = mockFetch(handler);
   const delays = [];
   const sleepImpl =
@@ -70,6 +70,7 @@ function makePlatform(handler, { env = {}, sleep, retryBaseMs } = {}) {
     log: () => {},
     sleep: sleepImpl,
     ...(retryBaseMs === undefined ? {} : { retryBaseMs }),
+    ...(now === undefined ? {} : { now }),
   });
   return { platform, fetchImpl, calls: fetchImpl.calls, delays };
 }
@@ -824,4 +825,185 @@ test("requests carry auth headers and never put the token in the URL", async () 
     assert.equal(call.headers["User-Agent"], "code-review-agent");
     assert.ok(!call.url.includes(TOKEN));
   }
+});
+
+// ---------------------------------------------------------------------------
+// Secondary rate limits
+// ---------------------------------------------------------------------------
+
+test("retries a 403 secondary rate limit that carries Retry-After", async () => {
+  let attempts = 0;
+  const { platform, calls, delays } = makePlatform(() => {
+    attempts += 1;
+    if (attempts === 1) {
+      return jsonResponse(
+        { message: "You have exceeded a secondary rate limit." },
+        { status: 403, headers: { "retry-after": "1" } },
+      );
+    }
+    return jsonResponse({ id: 5 });
+  });
+
+  await platform.setStatus("success", "ok");
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(delays, [1000]);
+  assert.equal(calls[1].body.state, "success");
+});
+
+test("retries a 403 whose body names the secondary rate limit", async () => {
+  let attempts = 0;
+  const { platform, calls, delays } = makePlatform(() => {
+    attempts += 1;
+    if (attempts === 1) {
+      return jsonResponse({ message: "You have exceeded a secondary rate limit. Please wait." }, { status: 403 });
+    }
+    return jsonResponse({ id: 6 });
+  });
+
+  await platform.setStatus("success", "ok");
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(delays, [250], "falls back to the generated backoff");
+});
+
+test("uses x-ratelimit-reset for a 403 with no remaining quota", async () => {
+  const clock = 1_700_000_000_000;
+  let attempts = 0;
+  const { platform, calls, delays } = makePlatform(
+    () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return jsonResponse(
+          { message: "API rate limit exceeded" },
+          { status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(clock / 1000 + 2) } },
+        );
+      }
+      return jsonResponse({ id: 7 });
+    },
+    { now: () => clock },
+  );
+
+  await platform.setStatus("success", "ok");
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(delays, [2000]);
+});
+
+test("bounds the total wait spent on 403 secondary rate limits", async () => {
+  const { platform, calls, delays } = makePlatform(() =>
+    jsonResponse({ message: "secondary rate limit" }, { status: 403, headers: { "retry-after": "35" } }),
+  );
+
+  await assert.rejects(platform.setStatus("failure", "Nope"), /rate-limit retry wait would exceed 60000ms/);
+  assert.equal(calls.length, 2, "two waits of 35s may not fit in the 60s budget");
+  assert.deepEqual(delays, [35_000]);
+});
+
+test("does not retry a plain 403 that carries no rate-limit signal", async () => {
+  const { platform, calls, delays } = makePlatform(() =>
+    jsonResponse({ message: "Resource not accessible by integration" }, { status: 403, headers: { "x-ratelimit-remaining": "12" } }),
+  );
+
+  await assert.rejects(platform.setStatus("failure", "Nope"), /403/);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(delays, []);
+});
+
+test("treats a padded x-ratelimit-remaining header as exhausted", async () => {
+  const clock = 1_700_000_000_000;
+  let attempts = 0;
+  const { platform, calls, delays } = makePlatform(
+    () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return jsonResponse(
+          { message: "API rate limit exceeded" },
+          { status: 403, headers: { "x-ratelimit-remaining": " 0 ", "x-ratelimit-reset": String(clock / 1000 + 1) } },
+        );
+      }
+      return jsonResponse({ id: 8 });
+    },
+    { now: () => clock },
+  );
+
+  await platform.setStatus("success", "ok");
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(delays, [1000]);
+});
+
+// ---------------------------------------------------------------------------
+// resolveThread pacing
+// ---------------------------------------------------------------------------
+
+function pacedClock(start = 1_000) {
+  const state = { clock: start, sleeps: [], order: [] };
+  state.now = () => state.clock;
+  state.sleep = async (ms) => {
+    state.sleeps.push(ms);
+    state.clock += ms;
+  };
+  return state;
+}
+
+const resolveResponse = () =>
+  jsonResponse({ data: { resolveReviewThread: { thread: { id: "T", isResolved: true } } } });
+
+test("paces successive resolve mutations without delaying the first one", async () => {
+  const clock = pacedClock();
+  const { platform, calls } = makePlatform(resolveResponse, { now: clock.now, sleep: clock.sleep });
+
+  await platform.resolveThread({ id: "T1" });
+  await platform.resolveThread({ id: "T2" });
+  await platform.resolveThread({ id: "T3" });
+
+  assert.deepEqual(clock.sleeps, [250, 250]);
+  assert.deepEqual(calls.map((call) => call.body.variables.id), ["T1", "T2", "T3"]);
+});
+
+test("paces resolve mutations that are issued concurrently", async () => {
+  const clock = pacedClock();
+  const { platform, calls } = makePlatform(
+    (call) => {
+      clock.order.push({ id: call.body.variables.id, at: clock.clock });
+      return resolveResponse();
+    },
+    { now: clock.now, sleep: clock.sleep },
+  );
+
+  await Promise.all([
+    platform.resolveThread({ id: "T1" }),
+    platform.resolveThread({ id: "T2" }),
+    platform.resolveThread({ id: "T3" }),
+  ]);
+
+  assert.deepEqual(calls.map((call) => call.body.variables.id), ["T1", "T2", "T3"]);
+  assert.deepEqual(clock.sleeps, [250, 250]);
+  assert.deepEqual(
+    clock.order.map((entry) => entry.at - clock.order[0].at),
+    [0, 250, 500],
+    "each mutation starts at least 250ms after the previous one",
+  );
+});
+
+test("a failed resolve mutation does not stall the ones queued behind it", async () => {
+  const clock = pacedClock();
+  const { platform, calls } = makePlatform(
+    (call) => (call.body.variables.id === "T1"
+      ? jsonResponse({ data: null, errors: [{ message: "boom" }] })
+      : resolveResponse()),
+    { now: clock.now, sleep: clock.sleep },
+  );
+
+  const results = await Promise.allSettled([
+    platform.resolveThread({ id: "T1" }),
+    platform.resolveThread({ id: "T2" }),
+  ]);
+
+  assert.equal(results[0].status, "rejected");
+  assert.match(results[0].reason.message, /boom/);
+  assert.equal(results[1].status, "fulfilled");
+  assert.deepEqual(clock.sleeps, [250]);
+  assert.equal(calls.length, 2);
 });

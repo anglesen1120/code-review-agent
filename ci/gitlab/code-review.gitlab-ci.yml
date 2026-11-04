@@ -1,24 +1,36 @@
 # Merge-request code review for GitLab CI. Include it from any project:
 #
 #   include:
-#     - remote: 'https://raw.githubusercontent.com/anglesen1120/code-review-agent/main/ci/gitlab/code-review.gitlab-ci.yml'
-#   # or, from a mirrored copy:
-#   #   - project: 'my-group/code-review-agent'
-#   #     file: 'ci/gitlab/code-review.gitlab-ci.yml'
-#     ref: main
+#     - remote: 'https://raw.githubusercontent.com/anglesen1120/code-review-agent/<tag-or-sha>/ci/gitlab/code-review.gitlab-ci.yml'
+#
+# Or, when the template lives in another project (pin the ref the same way):
+#
+#   include:
+#     - project: 'my-group/code-review-agent'
+#       file: 'ci/gitlab/code-review.gitlab-ci.yml'
+#       ref: '<tag-or-sha>'
+#
+# Replace <tag-or-sha> with a release tag or commit SHA that contains this
+# template (the existing v1 tag predates it). Never point a remote include at a
+# moving branch: an include is code that runs with your CI variables.
 #
 # Masked CI/CD variables (Settings -> CI/CD -> Variables):
 #   CRA_API_KEY   provider key for the analyzer (CRA_API_KEY)
 #   GITLAB_TOKEN  project/group access token, role Developer or higher, scope `api`.
 #                 CI_JOB_TOKEN cannot create or resolve MR discussions.
 #
-# Merge gate: the job exits 1 only if you add --fail-on; the inline MR threads
-# block merge only when the project enables
-# "Merge requests -> All threads must be resolved".
+# Merge gate: the inline MR threads block merge when the project enables
+# "Merge requests -> All threads must be resolved". The job exit code reflects
+# --fail-on plus fail-closed delivery/review failures (no thread posted, status
+# not set, or the whole diff over budget).
 
 code-review:
   stage: test
   image:
+    # Pin the image in real use: a version tag or a digest is reproducible,
+    # while `:latest` is mutable.
+    #   name: ghcr.io/anglesen1120/code-review-agent:0.1.0
+    #   name: ghcr.io/anglesen1120/code-review-agent@sha256:<digest>
     name: ghcr.io/anglesen1120/code-review-agent:latest
     entrypoint: [""] # the image entrypoint is `cra`; the script needs a shell
   rules:

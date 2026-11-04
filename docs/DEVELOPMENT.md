@@ -47,6 +47,9 @@ logic in exported pure functions so it stays testable.
 
 `cra analyze` reviews the working tree; with `--base` it reviews the branch
 against that base. No threads, no PR comments — report files and exit code only.
+Without `--base` there is no snapshot: the model reads the live checkout, so
+`grep` can reach `.git`. Use `--base` (snapshot + symlink removal) when you want
+the same isolation as CI.
 
 ```bash
 cd /path/to/consumer-repo
@@ -65,14 +68,19 @@ Useful flags while developing:
 
 - `--dry-run` — with a platform, compute and print the post/keep/resolve plan
   without writing anything.
-- `--out-dir DIR` — scratch dir (default `.review` for `analyze`, a temp dir
-  otherwise). It holds `pr.diff`, `findings.json`, `existing_threads.json`,
-  `result.json`, `opencode.json`, `events.jsonl` and `opencode.err`.
+- `--out-dir DIR` — scratch dir (default `.review` for `analyze`, `.cra` on
+  GitLab CI for artifacts, `$RUNNER_TEMP/cra` when that is set, otherwise a
+  private `cra-*` directory under the system temp dir). It holds `pr.diff`,
+  `findings.json`, `existing_threads.json`, `result.json`, `opencode.json`,
+  `events.jsonl` and `opencode.err`. The analysis snapshot is separate: a
+  private `cra-snap-*` temp dir outside the checkout with its own `git init`,
+  removed at the end of the run.
 - `--max-diff-bytes N` / `--exclude 'glob,glob'` — diff budget and extra
-  exclusions.
+  exclusions (`--exclude` also applies to the working-tree diff).
 - `--model`, `--base-url` — point at another OpenAI-compatible endpoint.
 - `--fail-on critical|warning` — exercise the gate locally; remember that a
-  failed analysis exits 1 only when this is not `none`.
+  failed analysis exits 1 only when this is not `none`. A diff that exceeds the
+  budget entirely exits 1 regardless, because nothing was reviewed.
 
 Only **added/modified lines inside diff hunks** can be anchored as inline
 threads; everything else goes to the summary. If a finding you expect is

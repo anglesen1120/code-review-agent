@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  DEFAULT_EXCLUDES, parseUnifiedDiff, splitDiffByFile, capDiff, gitDiff, changedFilesBetween,
+  DEFAULT_EXCLUDES, assertRevision, parseUnifiedDiff, splitDiffByFile, capDiff, gitDiff, changedFilesBetween,
+  snapshotTree, workingTreeDiff,
 } from "../src/diff.js";
 
 const FIXTURE = [
@@ -296,4 +297,68 @@ test("changedFilesBetween returns names, or null for an unreachable revision", (
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   assert.deepEqual(changedFilesBetween({ from: first, to: head, cwd: dir }), ["a.txt", "dist/out.js", "package-lock.json", "src/keep.js"]);
   assert.equal(changedFilesBetween({ from: "0123456789abcdef0123456789abcdef01234567", to: head, cwd: dir }), null);
+});
+
+test("workingTreeDiff reviews tracked local changes with the same exclusions", (t) => {
+  const { dir, head } = repo();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(join(dir, "a.txt"), "one\ntwo\nthree\n");
+  writeFileSync(join(dir, "package-lock.json"), '{"version":3}\n');
+  writeFileSync(join(dir, "dist/out.js"), "compiled-again\n");
+  const plain = workingTreeDiff({ cwd: dir });
+  assert.deepEqual(plain.changedFiles, ["a.txt"]);
+  assert.match(plain.diff, /^\+three$/m);
+  assert.doesNotMatch(plain.diff, /package-lock/);
+  assert.doesNotMatch(plain.diff, /dist\/out\.js/);
+  const scoped = workingTreeDiff({ cwd: dir, excludes: ["a.txt"] });
+  assert.deepEqual(scoped.changedFiles, []);
+  assert.equal(scoped.diff.trim(), "");
+  assert.equal(head.length, 40);
+});
+
+test("assertRevision rejects option-like and whitespace revisions", () => {
+  assert.throws(() => assertRevision("base", "--upload-pack=/tmp/x"), TypeError);
+  assert.throws(() => assertRevision("head", "HEAD~1 extra"), TypeError);
+  assert.throws(() => assertRevision("head", ""), TypeError);
+  assert.doesNotThrow(() => assertRevision("head", "origin/main"));
+});
+
+test("snapshotTree removes symlinks and refuses a non-empty destination", (t) => {
+  const { dir, git } = repo();
+  const outside = mkdtempSync(join(tmpdir(), "cra-outside-"));
+  t.after(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+  writeFileSync(join(outside, "secret.txt"), "leak\n");
+  mkdirSync(join(outside, "hosts"), { recursive: true });
+  writeFileSync(join(outside, "hosts", "passwd"), "leak\n");
+  symlinkSync(join(outside, "secret.txt"), join(dir, "leak.txt"));
+  symlinkSync(join(outside, "hosts"), join(dir, "leakdir"));
+  git("add", "-A");
+  git("commit", "-q", "-m", "symlinks");
+  const rev = git("rev-parse", "HEAD").trim();
+
+  const dest = mkdtempSync(join(tmpdir(), "cra-snap-"));
+  t.after(() => rmSync(dest, { recursive: true, force: true }));
+  const result = snapshotTree({ rev, cwd: dir, dest });
+  assert.deepEqual(result, { dir: dest, symlinksRemoved: 2 });
+  assert.equal(existsSync(join(dest, "leak.txt")), false, "symlink to a file is gone");
+  assert.equal(existsSync(join(dest, "leakdir")), false, "symlink to a directory is gone");
+  assert.equal(readFileSync(join(dest, "a.txt"), "utf8"), "one\ntwo\n");
+  assert.ok(existsSync(join(dest, ".git")), "snapshot has its own (empty) repository");
+  const symlinks = [];
+  const walk = (d) => {
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      const path = join(d, entry.name);
+      if (entry.isSymbolicLink()) symlinks.push(path);
+      else if (entry.isDirectory()) walk(path);
+    }
+  };
+  walk(dest);
+  assert.deepEqual(symlinks, [], "no symlink survives anywhere in the snapshot");
+
+  writeFileSync(join(dest, "keep.txt"), "x\n");
+  assert.throws(() => snapshotTree({ rev, cwd: dir, dest }), /not empty/);
+  assert.equal(readFileSync(join(dest, "keep.txt"), "utf8"), "x\n", "a refused destination is not modified");
 });
