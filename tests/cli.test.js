@@ -460,11 +460,16 @@ function makeOrigin() {
   git(origin, "add", ".");
   git(origin, "commit", "-qm", "user");
   const userSha = git(origin, "rev-parse", "HEAD");
+  git(origin, "checkout", "-qb", "sửa-lỗi/ống");
+  writeFileSync(join(origin, "uni.js"), "uni\n");
+  git(origin, "add", ".");
+  git(origin, "commit", "-qm", "unicode");
+  const uniSha = git(origin, "rev-parse", "HEAD");
   git(origin, "checkout", "-q", "main");
   writeFileSync(join(origin, "b.js"), "b\n");
   git(origin, "add", ".");
   git(origin, "commit", "-qm", "main tip");
-  return { origin, featureSha, plusSha, userSha };
+  return { origin, featureSha, plusSha, userSha, uniSha };
 }
 
 function shallowClone(origin) {
@@ -525,14 +530,17 @@ test("fetching origin/HEAD never dereferences its symref", (t) => {
 });
 
 test("ensureCommits still fetches legitimate refs through --", (t) => {
-  const { origin, featureSha, plusSha, userSha } = makeOrigin();
+  const { origin, featureSha, plusSha, userSha, uniSha } = makeOrigin();
   const work = shallowClone(origin);
   t.after(() => {
     for (const p of [origin, work]) rmSync(p, { recursive: true, force: true });
   });
   // Distinct tips: a skipped or misdirected fetch leaves the old FETCH_HEAD and fails.
-  assert.equal(new Set([featureSha, plusSha, userSha]).size, 3, "fixture branches differ");
-  const cases = [["origin/feature", featureSha], ["origin/plus/foo+bar", plusSha], ["origin/user@fix", userSha]];
+  assert.equal(new Set([featureSha, plusSha, userSha, uniSha]).size, 4, "fixture branches differ");
+  const cases = [
+    ["origin/feature", featureSha], ["origin/plus/foo+bar", plusSha],
+    ["origin/user@fix", userSha], ["origin/sửa-lỗi/ống", uniSha],
+  ];
   for (const [name, sha] of cases) {
     const logs = [];
     ensureCommits([name], work, (m) => logs.push(m));
