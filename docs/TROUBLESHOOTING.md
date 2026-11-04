@@ -75,8 +75,9 @@ non-zero or is killed counts as a failed attempt even when it printed valid JSON
 Common causes:
 
 - **Wrong or retired model.** The log shows `provider error: 400 … Model is
-  unavailable`. Providers retire model ids (OpenCode Go dropped
-  `deepseek-v4-flash`; the default is now `go/deepseek-v4.1-flash`). List the
+  unavailable`. Providers retire model ids (in November 2026 OpenCode Go
+  rejected `deepseek-v4-flash` and no longer listed it in `/models`; the
+  default is now `go/deepseek-v4.1-flash`). List the
   ids your key can use with `GET <base-url>/models` and set `model`/`CRA_MODEL`.
   A non-retryable provider error skips the second attempt.
 - **Missing key.** `CRA_API_KEY` (or the legacy `DEEPSEEK_API_KEY`) is empty —
