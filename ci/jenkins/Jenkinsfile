@@ -1,0 +1,56 @@
+// Declarative pipeline for multibranch jobs (GitHub Branch Source, GitLab,
+// Bitbucket Branch Source). Only change requests are reviewed.
+//
+// Credentials: add a secret text credential with the id `cra-api-key`
+// holding the provider key. See docs/CI-INTEGRATIONS.md.
+pipeline {
+  agent {
+    docker {
+      // Pin the image in real use: a version tag or a digest is reproducible,
+      // while `:latest` is mutable.
+      //   image 'ghcr.io/anglesen1120/code-review-agent:0.1.0'
+      //   image 'ghcr.io/anglesen1120/code-review-agent@sha256:<digest>'
+      image 'ghcr.io/anglesen1120/code-review-agent:latest'
+      // The image entrypoint is `cra`; Jenkins starts the container with its
+      // own command, so reset the entrypoint. HOME must be writable for the
+      // uid Jenkins uses to run the container.
+      args '--entrypoint= -e HOME=/tmp'
+      reuseNode true
+    }
+  }
+
+  options {
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  stages {
+    stage('Code review') {
+      when { changeRequest() }
+      environment {
+        CRA_API_KEY = credentials('cra-api-key')
+      }
+      steps {
+        // CHANGE_TARGET is the PR destination branch. Shallow multibranch
+        // clones do not carry origin/<target>, so fetch it explicitly.
+        sh '''
+          set -eu
+          git fetch --no-tags origin "+refs/heads/${CHANGE_TARGET}:refs/remotes/origin/${CHANGE_TARGET}"
+          cra review --platform none \
+            --base "origin/${CHANGE_TARGET}" \
+            --fail-on critical \
+            --sarif cra.sarif \
+            --markdown cra-report.md
+        '''
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'cra-report.md, cra.sarif', allowEmptyArchive: true
+          // Optional, with the Warnings NG plugin installed:
+          // recordIssues(tools: [sarif(pattern: 'cra.sarif')])
+        }
+      }
+    }
+  }
+}

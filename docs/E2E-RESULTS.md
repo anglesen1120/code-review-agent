@@ -56,6 +56,10 @@ no human action:
 post-review: posted 0, resolved 2, unresolved 1
 ```
 
+(The log line above is the pre-CLI poster from that run; the current entry point
+prints the same counters as `cra: posted 0, resolved 2, unresolved 1`. The
+behaviour it records is unchanged.)
+
 Observed thread state after the run:
 
 | Thread | State |

@@ -4,6 +4,15 @@
   "description": "Self-contained CodeRabbit-like code review agent. opencode analyzer + deterministic GitHub thread poster.",
   "private": true,
   "type": "module",
+  "bin": {
+    "cra": "bin/cra.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "prompts/",
+    "schema/"
+  ],
   "engines": {
     "node": ">=20"
   },

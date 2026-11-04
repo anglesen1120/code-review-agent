@@ -1,0 +1,61 @@
+# Azure Pipelines PR validation.
+#
+# Azure Repos has no YAML `pr:` trigger for Git repositories: add a build
+# validation branch policy for the target branch that runs this pipeline. The
+# `pr:` block below only takes effect for GitHub/Bitbucket repositories.
+#
+# Pipeline variable (secret): CRA_API_KEY with the provider key.
+#
+# Private Azure Repos: `checkout: self` with `fetchDepth: 0` fetches the full
+# history, so `origin/<target>` is already present and the review needs no
+# remote access. `persistCredentials: false` keeps the job token out of
+# `.git/config`, so no token is passed to `cra` at all.
+pr:
+  branches:
+    include:
+      - '*'
+
+jobs:
+  - job: code_review
+    pool:
+      vmImage: ubuntu-latest
+    container:
+      # Pin the image in real use: a version tag or a digest is reproducible,
+      # while `:latest` is mutable.
+      #   image: ghcr.io/anglesen1120/code-review-agent:0.1.0
+      #   image: ghcr.io/anglesen1120/code-review-agent@sha256:<digest>
+      image: ghcr.io/anglesen1120/code-review-agent:latest
+      # Azure container jobs expect an image without ENTRYPOINT and run steps
+      # with `docker exec`. The image's non-root uid (10001) cannot write into
+      # the agent-owned workspace mount, so the step clears the entrypoint and
+      # runs as root. See docs/CI-INTEGRATIONS.md for the self-hosted
+      # alternative (run as the uid that owns the clone).
+      options: '--entrypoint="" -u 0'
+    steps:
+      - checkout: self
+        fetchDepth: 0
+        persistCredentials: false
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$BUILD_ARTIFACTSTAGINGDIRECTORY/CodeAnalysisLogs"
+          cra review --platform none --fail-on critical \
+            --sarif "$BUILD_ARTIFACTSTAGINGDIRECTORY/CodeAnalysisLogs/cra.sarif" \
+            --markdown "$BUILD_ARTIFACTSTAGINGDIRECTORY/cra-report.md"
+        displayName: Code review
+        env:
+          CRA_API_KEY: $(CRA_API_KEY)
+
+      - task: PublishPipelineArtifact@1
+        condition: always()
+        displayName: Publish SARIF (SAST scans tab)
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/CodeAnalysisLogs
+          artifact: CodeAnalysisLogs
+
+      - task: PublishPipelineArtifact@1
+        condition: always()
+        displayName: Publish markdown report
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/cra-report.md
+          artifact: code-review-report

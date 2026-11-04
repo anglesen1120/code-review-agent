@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+tests
+docs
+skills
+example
+ci
+action.yml
+.env
+.env.*
+.review
+.cra
+*.log
+README.md
